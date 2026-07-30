@@ -1,0 +1,6 @@
+{
+  "name": "AudioSync",
+  "description": "Real-time multi-device audio synchronization platform turning smartphones into a distributed speaker system with millisecond precision.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
