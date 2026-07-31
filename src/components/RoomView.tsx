@@ -64,6 +64,17 @@ export const RoomView: React.FC<RoomViewProps> = ({
     return () => clearInterval(timer);
   }, [isPlaying, room.playback.position, room.playback.serverScheduledTimestamp]);
 
+  // Preload every track's audio buffer the moment it's known — decouples the
+  // (variable, per-device) download+decode time from the synced start countdown,
+  // so by the time Play is actually pressed, most devices already have it cached.
+  useEffect(() => {
+    room.queue.forEach((track) => {
+      audioEngine.loadAudioBuffer(track.audioUrl, track.id).catch(() => {
+        // Preload failures are non-fatal — schedulePlayback will retry on demand.
+      });
+    });
+  }, [room.queue]);
+
   useEffect(() => {
     if (currentTrack) {
       if (isPlaying && room.playback.serverScheduledTimestamp > 0) {
@@ -137,51 +148,95 @@ export const RoomView: React.FC<RoomViewProps> = ({
     audioEngine.setVolume(nextMuted ? 0 : localVolume);
   };
 
+  const [isRecalibrating, setIsRecalibrating] = useState<boolean>(false);
+
   const handleRecalibrateSync = () => {
-    socketClient.sendClockPing();
+    if (isRecalibrating) return;
+    setIsRecalibrating(true);
+    // A single ping barely moves a 20-sample rolling average — send a quick burst
+    // so the recalibration is both real and visible in the numbers below.
+    for (let i = 0; i < 6; i++) {
+      setTimeout(() => socketClient.sendClockPing(), i * 120);
+    }
+    setTimeout(() => setIsRecalibrating(false), 1000);
   };
 
   const [isUploadingTrack, setIsUploadingTrack] = useState<boolean>(false);
+  const [uploadProgressPct, setUploadProgressPct] = useState<number>(0);
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
 
     setIsUploadingTrack(true);
-    try {
-      const response = await fetch('/api/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': file.type || 'audio/mpeg' },
-        body: file
-      });
+    setUploadProgressPct(0);
 
-      if (!response.ok) {
-        throw new Error('Upload failed');
+    // Read the real track length from the local file itself, instead of guessing —
+    // this resolves independently of the upload and is usually ready almost instantly.
+    const probeUrl = URL.createObjectURL(file);
+    const probeAudio = new Audio();
+    let probedDurationSec = 0;
+    probeAudio.addEventListener('loadedmetadata', () => {
+      if (isFinite(probeAudio.duration)) probedDurationSec = probeAudio.duration;
+    });
+    probeAudio.src = probeUrl;
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.setRequestHeader('Content-Type', file.type || 'audio/mpeg');
+
+    // fetch() has no upload progress events — XHR does, so the button can show a
+    // real percentage instead of an indefinite "Uploading…" that feels stalled.
+    xhr.upload.onprogress = (evt) => {
+      if (evt.lengthComputable) {
+        setUploadProgressPct(Math.round((evt.loaded / evt.total) * 100));
+      }
+    };
+
+    const finish = () => {
+      URL.revokeObjectURL(probeUrl);
+      setIsUploadingTrack(false);
+      setUploadProgressPct(0);
+    };
+
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        console.error('Upload failed with status', xhr.status);
+        finish();
+        return;
       }
 
-      const { url } = await response.json();
+      try {
+        const { url } = JSON.parse(xhr.responseText);
+        const customTrack: AudioTrack = {
+          id: 'custom_' + Date.now(),
+          title: file.name.replace(/\.[^/.]+$/, ''),
+          artist: me?.name || 'Local upload',
+          album: 'Host library',
+          duration: probedDurationSec || 240,
+          coverUrl: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&w=600&q=80',
+          audioUrl: url,
+          genre: 'Custom file',
+          isCustom: true
+        };
 
-      const customTrack: AudioTrack = {
-        id: 'custom_' + Date.now(),
-        title: file.name.replace(/\.[^/.]+$/, ''),
-        artist: me?.name || 'Local upload',
-        album: 'Host library',
-        duration: 240,
-        coverUrl: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&w=600&q=80',
-        audioUrl: url,
-        genre: 'Custom file',
-        isCustom: true
-      };
+        const newQueue = [...room.queue, customTrack];
+        socketClient.send('QUEUE_UPDATE', { queue: newQueue });
+        handleSelectTrack(customTrack);
+      } catch (err) {
+        console.error('Failed to parse upload response:', err);
+      }
 
-      const newQueue = [...room.queue, customTrack];
-      socketClient.send('QUEUE_UPDATE', { queue: newQueue });
-      handleSelectTrack(customTrack);
-    } catch (err) {
-      console.error('Failed to upload track:', err);
-    } finally {
-      setIsUploadingTrack(false);
-      e.target.value = '';
-    }
+      finish();
+    };
+
+    xhr.onerror = () => {
+      console.error('Upload network error');
+      finish();
+    };
+
+    xhr.send(file);
   };
 
   const participantsList: Participant[] = Object.values(room.participants || {});
@@ -461,7 +516,7 @@ export const RoomView: React.FC<RoomViewProps> = ({
               } ${
                 isDarkMode ? 'border-white/10 hover:bg-white/5 text-zinc-300' : 'border-zinc-200 hover:bg-zinc-100 text-zinc-600'
               }`}>
-                <Upload size={13} /> {isUploadingTrack ? 'Uploading…' : 'Upload file'}
+                <Upload size={13} /> {isUploadingTrack ? `Uploading… ${uploadProgressPct}%` : 'Upload file'}
                 <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" disabled={isUploadingTrack} />
               </label>
             </div>
@@ -512,11 +567,13 @@ export const RoomView: React.FC<RoomViewProps> = ({
 
               <button
                 onClick={handleRecalibrateSync}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition ${
+                disabled={isRecalibrating}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition disabled:opacity-60 ${
                   isDarkMode ? 'border-white/10 hover:bg-white/5 text-zinc-300' : 'border-zinc-200 hover:bg-zinc-100 text-zinc-600'
                 }`}
               >
-                <RefreshCw size={13} /> Recalibrate
+                <RefreshCw size={13} className={isRecalibrating ? 'animate-spin' : ''} />
+                {isRecalibrating ? 'Recalibrating…' : 'Recalibrate'}
               </button>
             </div>
 

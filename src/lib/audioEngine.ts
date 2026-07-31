@@ -23,6 +23,14 @@ class AudioEngine {
   private scheduledAudioContextStartTime: number = 0;
   private scheduledAudioOffsetSec: number = 0;
 
+  // Continuous drift correction (the technique Snapcast/AirPlay use instead of a
+  // single one-shot scheduled start): track the absolute server-time target so we
+  // can keep re-checking actual vs. expected position throughout playback.
+  private driftCorrectionIntervalId: any = null;
+  private activeServerScheduledTimestampMs: number = 0;
+  private activeStartPositionOffsetSec: number = 0;
+  private activeBasePlaybackRate: number = 1.0;
+
   constructor() {
     // Lazy initialization on user interaction
   }
@@ -202,6 +210,10 @@ class AudioEngine {
   }
 
   private stopActiveSource(): void {
+    if (this.driftCorrectionIntervalId) {
+      clearInterval(this.driftCorrectionIntervalId);
+      this.driftCorrectionIntervalId = null;
+    }
     if (this.currentSource) {
       try {
         this.currentSource.onended = null;
@@ -248,6 +260,10 @@ class AudioEngine {
     source.playbackRate.value = playbackRate;
     source.connect(this.channelFilter!);
 
+    this.activeServerScheduledTimestampMs = serverScheduledTimestampMs;
+    this.activeStartPositionOffsetSec = startPositionOffsetSec;
+    this.activeBasePlaybackRate = playbackRate;
+
     if (secUntilStart > 0) {
       // Future scheduling: Start audio at exact context time in future
       const targetCtxTime = ctx.currentTime + secUntilStart;
@@ -273,6 +289,74 @@ class AudioEngine {
         this.currentSource = null;
       }
     };
+
+    this.startDriftCorrectionLoop();
+  }
+
+  // Continuously compare where this device's audio actually is against where the
+  // server's shared clock says it should be, and pull it back into line — small
+  // drift is corrected with a gentle, inaudible playback-rate nudge (the same trick
+  // Snapcast/AirPlay use); anything large enough to suggest a stall or tab-throttle
+  // gets a hard resync instead of slowly drifting further.
+  private startDriftCorrectionLoop(): void {
+    if (this.driftCorrectionIntervalId) clearInterval(this.driftCorrectionIntervalId);
+
+    this.driftCorrectionIntervalId = setInterval(() => {
+      if (!this.ctx || !this.currentSource) return;
+
+      const estServerTime = this.getEstimatedServerTime();
+      const elapsedServerSec = Math.max(0, (estServerTime - this.activeServerScheduledTimestampMs) / 1000);
+      const expectedPositionSec = this.activeStartPositionOffsetSec + elapsedServerSec * this.activeBasePlaybackRate;
+      const actualPositionSec = this.getCurrentTrackPosition();
+      const driftMs = (expectedPositionSec - actualPositionSec) * 1000;
+
+      if (Math.abs(driftMs) > 200) {
+        // Large drift — likely a throttled/backgrounded tab or a network stall.
+        // A gentle rate nudge would take too long to catch up audibly; jump instead.
+        this.hardResync(expectedPositionSec);
+        return;
+      }
+
+      if (Math.abs(driftMs) < 12) {
+        // Within tolerance — ease back to nominal speed.
+        this.currentSource.playbackRate.setTargetAtTime(this.activeBasePlaybackRate, this.ctx.currentTime, 0.5);
+        return;
+      }
+
+      // Moderate drift: nudge playback speed by ~2% to pull back into sync over a
+      // couple of seconds, rather than an audible jump.
+      const corrected = driftMs > 0
+        ? this.activeBasePlaybackRate * 1.02
+        : this.activeBasePlaybackRate * 0.98;
+      this.currentSource.playbackRate.setTargetAtTime(corrected, this.ctx.currentTime, 0.3);
+    }, 1500);
+  }
+
+  private hardResync(targetPositionSec: number): void {
+    if (!this.ctx || !this.currentSource) return;
+    const buffer = this.currentSource.buffer;
+    if (!buffer || targetPositionSec < 0 || targetPositionSec >= buffer.duration) return;
+
+    const rate = this.activeBasePlaybackRate;
+    this.stopActiveSource();
+
+    const source = this.ctx.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = rate;
+    source.connect(this.channelFilter!);
+    source.start(this.ctx.currentTime, targetPositionSec);
+
+    this.scheduledAudioContextStartTime = this.ctx.currentTime;
+    this.scheduledAudioOffsetSec = targetPositionSec;
+    this.currentSource = source;
+
+    source.onended = () => {
+      if (this.currentSource === source) {
+        this.currentSource = null;
+      }
+    };
+
+    this.startDriftCorrectionLoop();
   }
 
   public stopPlayback(): void {

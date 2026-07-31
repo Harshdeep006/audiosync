@@ -7,6 +7,7 @@ import { RoomView } from './components/RoomView';
 import { QRCodeModal } from './components/QRCodeModal';
 import { ArchitectureModal } from './components/ArchitectureModal';
 import { socketClient } from './lib/socketClient';
+import { audioEngine } from './lib/audioEngine';
 import { Room, AudioChannelRole, WSMessage } from './types';
 
 export default function App() {
@@ -61,6 +62,9 @@ export default function App() {
     channelRole: AudioChannelRole;
     deviceType: string;
   }) => {
+    // Must happen synchronously inside this click handler — browsers only allow
+    // audio playback to start if it traces back to a real user gesture like this.
+    audioEngine.initAudioContext();
     socketClient.send('CREATE_ROOM', data);
     setIsCreateModalOpen(false);
   };
@@ -71,6 +75,7 @@ export default function App() {
     channelRole: AudioChannelRole;
     deviceType: string;
   }) => {
+    audioEngine.initAudioContext();
     socketClient.send('JOIN_ROOM', data);
     setIsJoinModalOpen(false);
   };
@@ -82,6 +87,7 @@ export default function App() {
 
   const handleQuickDemo = () => {
     // Instant 1-Click Demo
+    audioEngine.initAudioContext();
     socketClient.send('CREATE_ROOM', {
       roomName: 'Demo Spatial Array Room',
       userName: 'Main Phone (Host)',
