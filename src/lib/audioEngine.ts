@@ -1,4 +1,5 @@
 import { AudioChannelRole, ClockSyncResult, PerformanceMetrics } from '../types';
+import { getServerOffset } from './socketClient';
 
 class AudioEngine {
   private ctx: AudioContext | null = null;
@@ -6,7 +7,7 @@ class AudioEngine {
   private channelFilter: BiquadFilterNode | null = null;
   private panner: StereoPannerNode | null = null;
   private analyser: AnalyserNode | null = null;
-  
+
   private currentSource: AudioBufferSourceNode | null = null;
   private audioBufferCache: Map<string, AudioBuffer> = new Map();
   private isLoadingTrack: boolean = false;
@@ -86,7 +87,7 @@ class AudioEngine {
 
     // Use samples with lowest RTT for maximum offset accuracy
     const validSamples = this.clockOffsets.filter((_, idx) => this.rttHistory[idx] <= medianRtt * 1.8);
-    
+
     if (validSamples.length > 0) {
       const sum = validSamples.reduce((acc, val) => acc + val, 0);
       this.smoothedClockOffset = sum / validSamples.length;
@@ -226,7 +227,10 @@ class AudioEngine {
     }
   }
 
-  // Precise Millisecond Scheduled Playback
+  // -------------------------------------------------------------------------
+  // Precise Millisecond Scheduled Playback (legacy path — server scheduled
+  // timestamp is provided as a UTC ms value on the shared server clock)
+  // -------------------------------------------------------------------------
   public async schedulePlayback(
     audioUrl: string,
     trackId: string,
@@ -235,7 +239,7 @@ class AudioEngine {
     playbackRate: number = 1.0
   ): Promise<void> {
     const ctx = this.initAudioContext();
-    
+
     // Increment session ID & stop current playing source immediately
     this.currentPlaybackId++;
     const session = this.currentPlaybackId;
@@ -290,6 +294,99 @@ class AudioEngine {
       }
     };
 
+    this.startDriftCorrectionLoop();
+  }
+
+  // -------------------------------------------------------------------------
+  // "Play At" Architecture — sample-accurate scheduled playback
+  //
+  // `playAt`  — absolute server-clock UTC millisecond timestamp at which audio
+  //             should begin (e.g. Date.now() + 1000 on the server).
+  // `startOffsetInTrack` — position within the audio buffer to start from (s).
+  // `playbackRate`       — playback speed multiplier (default 1.0).
+  //
+  // Algorithm:
+  //   1. Compute current server time:   serverNow = Date.now() + serverOffset
+  //   2. Compute delay:                 delayInSeconds = (playAt - serverNow) / 1000
+  //   3a. Future packet (delay > 0):    source.start(ctx.currentTime + delay, offset)
+  //   3b. Late packet  (delay <= 0):    source.start(0, offset + |delay|)  ← catch-up
+  // -------------------------------------------------------------------------
+  public async playWithTimestamp(
+    audioUrl: string,
+    trackId: string,
+    playAt: number,              // UTC ms on server clock when playback begins
+    startOffsetInTrack: number = 0,
+    playbackRate: number = 1.0
+  ): Promise<void> {
+    const ctx = this.initAudioContext();
+
+    this.currentPlaybackId++;
+    const session = this.currentPlaybackId;
+    this.stopActiveSource();
+
+    const buffer = await this.loadAudioBuffer(audioUrl, trackId);
+
+    // Bail if another playback command arrived while the buffer was loading
+    if (this.currentPlaybackId !== session) return;
+    this.stopActiveSource();
+
+    // ---- Core "Play At" calculation ----------------------------------------
+    // Use the live serverOffset exported from socketClient so this value always
+    // reflects the most recent NTP ping_offset round-trip measurement.
+    const serverNow = Date.now() + getServerOffset();
+    const delayInSeconds = (playAt - serverNow) / 1000;
+    // ------------------------------------------------------------------------
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = playbackRate;
+    source.connect(this.channelFilter!);
+
+    this.activeServerScheduledTimestampMs = playAt;
+    this.activeStartPositionOffsetSec = startOffsetInTrack;
+    this.activeBasePlaybackRate = playbackRate;
+
+    if (delayInSeconds > 0) {
+      // Future scheduling — packet arrived on time; start precisely in the future
+      const scheduledCtxTime = ctx.currentTime + delayInSeconds;
+      source.start(scheduledCtxTime, Math.max(0, startOffsetInTrack));
+      this.scheduledAudioContextStartTime = scheduledCtxTime;
+      this.scheduledAudioOffsetSec = startOffsetInTrack;
+
+      console.debug(
+        `[AudioEngine] playWithTimestamp: scheduling in ${(delayInSeconds * 1000).toFixed(1)} ms`
+      );
+    } else {
+      // Late arrival — packet took longer than the buffer window to arrive.
+      // Jump ahead in the track to the position we *should* currently be at
+      // so we land in sync with the rest of the room immediately.
+      const catchUpOffsetSec = startOffsetInTrack + Math.abs(delayInSeconds);
+
+      if (catchUpOffsetSec < buffer.duration) {
+        source.start(0, catchUpOffsetSec);
+        this.scheduledAudioContextStartTime = ctx.currentTime;
+        this.scheduledAudioOffsetSec = catchUpOffsetSec;
+
+        console.warn(
+          `[AudioEngine] playWithTimestamp: late by ${Math.abs(delayInSeconds * 1000).toFixed(1)} ms — catching up to ${catchUpOffsetSec.toFixed(3)} s`
+        );
+      } else {
+        // The catch-up position is past the end of the track; nothing to play
+        console.warn('[AudioEngine] playWithTimestamp: catch-up position exceeds buffer duration, skipping.');
+        return;
+      }
+    }
+
+    this.currentSource = source;
+
+    source.onended = () => {
+      if (this.currentSource === source) {
+        this.currentSource = null;
+      }
+    };
+
+    // Kick off continuous drift correction so any post-start clock drift is
+    // gently corrected via playback-rate nudging (the same Snapcast technique).
     this.startDriftCorrectionLoop();
   }
 

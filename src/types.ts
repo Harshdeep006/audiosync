@@ -82,7 +82,11 @@ export type WSMessageType =
   | 'QUEUE_UPDATE'
   | 'USER_LEFT'
   | 'ERROR'
-  | 'CALIBRATE_REQUEST';
+  | 'CALIBRATE_REQUEST'
+  // "Play At" architecture — NTP-style ping_offset and precision scheduling
+  | 'ping_offset'
+  | 'pong_offset'
+  | 'sync_play';
 
 export interface WSMessage {
   type: WSMessageType;
