@@ -117,10 +117,8 @@ export const RoomView: React.FC<RoomViewProps> = ({
     });
   };
 
-  const handleLocalRoleChange = (role: AudioChannelRole) => {
-    setLocalRole(role);
-    audioEngine.setChannelRole(role);
-    socketClient.send('ROLE_UPDATE', { channelRole: role });
+  const handleAssignRole = (targetClientId: string, role: AudioChannelRole) => {
+    socketClient.send('ROLE_UPDATE', { targetClientId, channelRole: role });
   };
 
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -139,26 +137,47 @@ export const RoomView: React.FC<RoomViewProps> = ({
     socketClient.sendClockPing();
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const [isUploadingTrack, setIsUploadingTrack] = useState<boolean>(false);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const fileUrl = URL.createObjectURL(file);
-    const customTrack: AudioTrack = {
-      id: 'custom_' + Date.now(),
-      title: file.name.replace(/\.[^/.]+$/, ''),
-      artist: me?.name || 'Local upload',
-      album: 'Host library',
-      duration: 240,
-      coverUrl: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&w=600&q=80',
-      audioUrl: fileUrl,
-      genre: 'Custom file',
-      isCustom: true
-    };
+    setIsUploadingTrack(true);
+    try {
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'audio/mpeg' },
+        body: file
+      });
 
-    const newQueue = [...room.queue, customTrack];
-    socketClient.send('QUEUE_UPDATE', { queue: newQueue });
-    handleSelectTrack(customTrack);
+      if (!response.ok) {
+        throw new Error('Upload failed');
+      }
+
+      const { url } = await response.json();
+
+      const customTrack: AudioTrack = {
+        id: 'custom_' + Date.now(),
+        title: file.name.replace(/\.[^/.]+$/, ''),
+        artist: me?.name || 'Local upload',
+        album: 'Host library',
+        duration: 240,
+        coverUrl: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&w=600&q=80',
+        audioUrl: url,
+        genre: 'Custom file',
+        isCustom: true
+      };
+
+      const newQueue = [...room.queue, customTrack];
+      socketClient.send('QUEUE_UPDATE', { queue: newQueue });
+      handleSelectTrack(customTrack);
+    } catch (err) {
+      console.error('Failed to upload track:', err);
+    } finally {
+      setIsUploadingTrack(false);
+      e.target.value = '';
+    }
   };
 
   const participantsList: Participant[] = Object.values(room.participants || {});
@@ -338,16 +357,34 @@ export const RoomView: React.FC<RoomViewProps> = ({
                       : (isDarkMode ? 'border-white/5 bg-white/[0.02]' : 'border-zinc-100 bg-zinc-50')
                   }`}
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 min-w-0">
                       <Smartphone size={14} className={subtle} />
                       <span className="font-medium text-xs truncate">
                         {p.name} {isMe ? '(you)' : ''}
                       </span>
                     </div>
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono uppercase shrink-0 ${subtle}`}>
-                      {p.channelRole}
-                    </span>
+
+                    {isHost ? (
+                      <select
+                        value={p.channelRole}
+                        onChange={(e) => handleAssignRole(p.id, e.target.value as AudioChannelRole)}
+                        className={`shrink-0 px-1.5 py-1 rounded text-[10px] font-mono uppercase border focus:outline-none focus:ring-1 focus:ring-blue-500 ${
+                          isDarkMode ? 'bg-black/30 border-white/10 text-zinc-300' : 'bg-white border-zinc-200 text-zinc-600'
+                        }`}
+                      >
+                        <option value="full">Full</option>
+                        <option value="bass">Bass</option>
+                        <option value="vocals">Vocals</option>
+                        <option value="treble">Treble</option>
+                        <option value="left">Left</option>
+                        <option value="right">Right</option>
+                      </select>
+                    ) : (
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono uppercase shrink-0 ${subtle}`}>
+                        {p.channelRole}
+                      </span>
+                    )}
                   </div>
 
                   <div className={`mt-1.5 flex items-center justify-between text-[11px] font-mono ${subtle}`}>
@@ -364,23 +401,15 @@ export const RoomView: React.FC<RoomViewProps> = ({
           </div>
 
           <div className={`pt-3 border-t ${isDarkMode ? 'border-white/10' : 'border-zinc-200'}`}>
-            <label className={`block text-[11px] font-medium uppercase tracking-wide mb-1.5 ${subtle}`}>
-              This device's role
-            </label>
-            <select
-              value={localRole}
-              onChange={(e) => handleLocalRoleChange(e.target.value as AudioChannelRole)}
-              className={`w-full px-3 py-2 rounded-lg text-xs font-medium border focus:outline-none focus:ring-1 focus:ring-blue-500 ${
-                isDarkMode ? 'bg-black/30 border-white/10 text-zinc-200' : 'bg-white border-zinc-200 text-zinc-700'
-              }`}
-            >
-              <option value="full">Full range (stereo)</option>
-              <option value="bass">Subwoofer (bass lowpass &lt;220Hz)</option>
-              <option value="vocals">Center vocal (mid-band 1200Hz)</option>
-              <option value="treble">High tweeter (highpass &gt;2500Hz)</option>
-              <option value="left">Left channel speaker</option>
-              <option value="right">Right channel speaker</option>
-            </select>
+            {isHost ? (
+              <p className={`text-[11px] leading-relaxed ${subtle}`}>
+                Tap the role dropdown next to any device above to assign it as left, right, bass, vocals, treble, or full range — including your own device.
+              </p>
+            ) : (
+              <p className={`text-[11px] leading-relaxed ${subtle}`}>
+                Your speaker role (<span className="font-mono uppercase">{me?.channelRole || 'full'}</span>) is assigned by the host and updates automatically.
+              </p>
+            )}
           </div>
         </div>
 
@@ -422,10 +451,12 @@ export const RoomView: React.FC<RoomViewProps> = ({
               </div>
 
               <label className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-medium cursor-pointer transition ${
+                isUploadingTrack ? 'opacity-50 pointer-events-none' : ''
+              } ${
                 isDarkMode ? 'border-white/10 hover:bg-white/5 text-zinc-300' : 'border-zinc-200 hover:bg-zinc-100 text-zinc-600'
               }`}>
-                <Upload size={13} /> Upload file
-                <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" />
+                <Upload size={13} /> {isUploadingTrack ? 'Uploading…' : 'Upload file'}
+                <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" disabled={isUploadingTrack} />
               </label>
             </div>
 

@@ -61,38 +61,49 @@ interface RoomServer {
 const DEFAULT_TRACKS: AudioTrackServer[] = [
   {
     id: 'track-1',
-    title: 'Neon Horizon (Synthesized Electro)',
-    artist: 'AudioSync Engine',
-    album: 'Distributed Sound Vol. 1',
-    duration: 180,
+    title: 'Joy',
+    artist: 'BeatsNecker',
+    album: 'BeatsNecker Originals',
+    duration: 32,
     coverUrl: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=600&q=80',
-    audioUrl: '/api/audio/synth-groove.mp3',
-    genre: 'Electronic'
+    audioUrl: '/audio/joy.mp3',
+    genre: 'Instrumental'
   },
   {
     id: 'track-2',
-    title: 'Midnight Bass Drive',
-    artist: 'Cyber Pulse',
-    album: 'Frequency Spectrum',
-    duration: 210,
+    title: 'Me',
+    artist: 'BeatsNecker',
+    album: 'BeatsNecker Originals',
+    duration: 27,
     coverUrl: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=600&q=80',
-    audioUrl: '/api/audio/bass-pulse.mp3',
-    genre: 'Synthwave'
+    audioUrl: '/audio/me.mp3',
+    genre: 'Instrumental'
   },
   {
     id: 'track-3',
-    title: 'Acoustic Waves & Harmonics',
-    artist: 'Spatial Audio Collective',
-    album: 'Multi-Channel Acoustic',
-    duration: 195,
+    title: 'Pure Heart',
+    artist: 'BeatsNecker',
+    album: 'BeatsNecker Originals',
+    duration: 34,
     coverUrl: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&w=600&q=80',
-    audioUrl: '/api/audio/chill-ambient.mp3',
-    genre: 'Ambient'
+    audioUrl: '/audio/pure-heart.mp3',
+    genre: 'Instrumental'
+  },
+  {
+    id: 'track-4',
+    title: 'Those Eyes',
+    artist: 'BeatsNecker',
+    album: 'BeatsNecker Originals',
+    duration: 40,
+    coverUrl: 'https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?auto=format&fit=crop&w=600&q=80',
+    audioUrl: '/audio/those-eyes.mp3',
+    genre: 'Instrumental'
   }
 ];
 
 const rooms = new Map<string, RoomServer>();
 const clients = new Map<string, ClientConnection>();
+const uploadedAudioFiles = new Map<string, { data: Buffer; contentType: string }>();
 
 function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -122,6 +133,34 @@ async function startServer() {
       connectedClients: clients.size,
       serverTime: Date.now()
     });
+  });
+
+  // Accept a custom-uploaded audio file and store it in memory so every
+  // connected device (not just the uploader) can fetch it back over the network.
+  app.post('/api/upload', express.raw({ type: '*/*', limit: '25mb' }), (req, res) => {
+    if (!req.body || !(req.body instanceof Buffer) || req.body.length === 0) {
+      res.status(400).json({ message: 'No file data received.' });
+      return;
+    }
+
+    const id = 'upload_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    const contentType = req.headers['content-type']?.toString() || 'audio/mpeg';
+    uploadedAudioFiles.set(id, { data: req.body, contentType });
+
+    res.json({ id, url: `/api/uploads/${id}` });
+  });
+
+  app.get('/api/uploads/:id', (req, res) => {
+    const file = uploadedAudioFiles.get(req.params.id);
+    if (!file) {
+      res.status(404).send('Upload not found — it may have been cleared by a server restart.');
+      return;
+    }
+
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', file.data.length.toString());
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.send(file.data);
   });
 
   // Simple WAV audio generator for synthetic test tracks if requested
@@ -450,10 +489,13 @@ async function startServer() {
           const room = rooms.get(roomCode);
           if (!room) return;
 
-          const p = room.participants.get(clientId);
+          const isSenderHost = room.hostId === clientId;
+          const targetId = (payload.targetClientId && isSenderHost) ? payload.targetClientId : clientId;
+
+          const p = room.participants.get(targetId);
           if (p) {
             if (payload.channelRole) p.channelRole = payload.channelRole;
-            if (payload.volume !== undefined) p.volume = payload.volume;
+            if (payload.volume !== undefined && targetId === clientId) p.volume = payload.volume;
             broadcastRoomState(roomCode);
           }
           return;

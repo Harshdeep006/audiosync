@@ -37,7 +37,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       audioEngine.initAudioContext();
       audioEngine.setChannelRole(samplerRole);
       await audioEngine.schedulePlayback(
-        '/api/audio/synth-groove.mp3',
+        '/audio/joy.mp3',
         'demo-sampler',
         Date.now() + 200,
         0,
