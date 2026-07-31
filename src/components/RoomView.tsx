@@ -29,6 +29,7 @@ export const RoomView: React.FC<RoomViewProps> = ({
   const [localRole, setLocalRole] = useState<AudioChannelRole>('full');
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [trackPositionSec, setTrackPositionSec] = useState<number>(0);
+  const [startingInMs, setStartingInMs] = useState<number>(0);
 
   const me = room.participants[myClientId];
   const isHost = room.hostId === myClientId;
@@ -52,13 +53,16 @@ export const RoomView: React.FC<RoomViewProps> = ({
     const timer = setInterval(() => {
       if (isPlaying) {
         setTrackPositionSec(audioEngine.getCurrentTrackPosition());
+        const msLeft = room.playback.serverScheduledTimestamp - audioEngine.getEstimatedServerTime();
+        setStartingInMs(msLeft > 0 ? msLeft : 0);
       } else {
         setTrackPositionSec(room.playback.position || 0);
+        setStartingInMs(0);
       }
     }, 250);
 
     return () => clearInterval(timer);
-  }, [isPlaying, room.playback.position]);
+  }, [isPlaying, room.playback.position, room.playback.serverScheduledTimestamp]);
 
   useEffect(() => {
     if (currentTrack) {
@@ -310,7 +314,9 @@ export const RoomView: React.FC<RoomViewProps> = ({
               </button>
 
               <p className={`text-xs ${subtle}`}>
-                {!isHost && !room.settings.allowParticipantControl ? 'Controlled by host' : 'Host controls active'}
+                {startingInMs > 250
+                  ? `Starting in ${(startingInMs / 1000).toFixed(1)}s…`
+                  : (!isHost && !room.settings.allowParticipantControl ? 'Controlled by host' : 'Host controls active')}
               </p>
             </div>
 

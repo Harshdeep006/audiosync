@@ -343,7 +343,7 @@ async function startServer() {
             settings: {
               autoSyncEnabled: true,
               maxAllowedDriftMs: 15,
-              bufferDurationMs: 1500,
+              bufferDurationMs: 4500,
               allowParticipantControl: false
             }
           };
@@ -442,7 +442,7 @@ async function startServer() {
 
           const { action, track, position, playbackRate } = payload;
           const currentServerTime = Date.now();
-          const bufferDelayMs = room.settings.bufferDurationMs || 1500;
+          const bufferDelayMs = room.settings.bufferDurationMs || 4500;
 
           if (action === 'PLAY') {
             room.playback.isPlaying = true;
