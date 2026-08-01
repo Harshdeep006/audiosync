@@ -31,6 +31,7 @@ class AudioEngine {
   private activeStartPositionOffsetSec: number = 0;
   private activeBasePlaybackRate: number = 1.0;
   private lastMeasuredDriftMs: number = 0;
+  private clockSampleCount: number = 0;
 
   constructor() {
     // Lazy initialization on user interaction
@@ -74,12 +75,13 @@ class AudioEngine {
   // Record NTP Ping-Pong measurement and calculate clock offset
   public recordClockMeasurement(sample: ClockSyncResult): void {
     const { rttMs, clockOffsetMs } = sample;
+    this.clockSampleCount++;
 
     this.rttHistory.push(rttMs);
-    if (this.rttHistory.length > 20) this.rttHistory.shift();
+    if (this.rttHistory.length > 10) this.rttHistory.shift();
 
     this.clockOffsets.push(clockOffsetMs);
-    if (this.clockOffsets.length > 20) this.clockOffsets.shift();
+    if (this.clockOffsets.length > 10) this.clockOffsets.shift();
 
     // Filter outliers based on RTT median
     const sortedRtt = [...this.rttHistory].sort((a, b) => a - b);
@@ -408,6 +410,10 @@ class AudioEngine {
 
   public getLastMeasuredDriftMs(): number {
     return this.lastMeasuredDriftMs;
+  }
+
+  public getClockSampleCount(): number {
+    return this.clockSampleCount;
   }
 }
 

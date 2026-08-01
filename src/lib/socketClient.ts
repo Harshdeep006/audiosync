@@ -94,12 +94,26 @@ class SocketClient {
   private startClockSyncLoop(): void {
     if (this.pingIntervalId) clearInterval(this.pingIntervalId);
 
-    // Initial rapid burst of 5 pings for immediate calibration
-    for (let i = 0; i < 5; i++) {
-      setTimeout(() => this.sendClockPing(), i * 150);
+    // Initial rapid burst of 10 pings for fast first-pass calibration —
+    // the very first pings after a fresh connection tend to be noisy
+    // (TLS handshake overhead, a cold server waking up), so more samples
+    // up front means outliers get outvoted quickly instead of lingering.
+    for (let i = 0; i < 10; i++) {
+      setTimeout(() => this.sendClockPing(), i * 200);
     }
 
-    // Continuous NTP clock alignment every 2.5 seconds
+    // Fast warm-up cadence for the first ~10 seconds while the offset is
+    // still settling, then ease back to a lighter steady-state interval.
+    let warmupPings = 0;
+    const warmupIntervalId = setInterval(() => {
+      this.sendClockPing();
+      warmupPings++;
+      if (warmupPings >= 12) {
+        clearInterval(warmupIntervalId);
+      }
+    }, 800);
+
+    // Continuous NTP clock alignment every 2.5 seconds, ongoing
     this.pingIntervalId = setInterval(() => {
       this.sendClockPing();
     }, 2500);

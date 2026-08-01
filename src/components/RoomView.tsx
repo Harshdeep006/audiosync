@@ -577,6 +577,14 @@ export const RoomView: React.FC<RoomViewProps> = ({
               </button>
             </div>
 
+            {audioEngine.getClockSampleCount() < 8 && (
+              <div className={`px-3 py-2 rounded-lg border text-xs flex items-center justify-between ${
+                isDarkMode ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-amber-300 bg-amber-50 text-amber-700'
+              }`}>
+                <span>Still calibrating — {audioEngine.getClockSampleCount()}/8 samples. Wait a few seconds before testing playback.</span>
+              </div>
+            )}
+
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
               <div className={`p-3 rounded-lg border ${isDarkMode ? 'border-white/10 bg-black/20' : 'border-zinc-200 bg-zinc-50'}`}>
                 <p className={`text-[11px] font-medium uppercase ${subtle}`}>RTT ping</p>
