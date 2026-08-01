@@ -320,6 +320,14 @@ class AudioEngine {
     this.driftCorrectionIntervalId = setInterval(() => {
       if (!this.ctx || !this.currentSource) return;
 
+      // Right at the moment scheduled playback actually begins, two independently
+      // clamped clocks (estimated server time vs. this device's AudioContext time)
+      // can cross zero a few hundred ms apart from each other even under perfect
+      // sync, producing a brief false drift reading. Skip correction during that
+      // narrow window instead of reacting to noise.
+      const sinceActualStartSec = this.ctx.currentTime - this.scheduledAudioContextStartTime;
+      if (sinceActualStartSec < 1.0) return;
+
       const estServerTime = this.getEstimatedServerTime();
       const elapsedServerSec = Math.max(0, (estServerTime - this.activeServerScheduledTimestampMs) / 1000);
       const expectedPositionSec = this.activeStartPositionOffsetSec + elapsedServerSec * this.activeBasePlaybackRate;
