@@ -385,7 +385,7 @@ async function startServer() {
             queue: [...DEFAULT_TRACKS],
             settings: {
               autoSyncEnabled: true,
-              maxAllowedDriftMs: 15,
+              maxAllowedDriftMs: 50,
               bufferDurationMs: 4500,
               allowParticipantControl: false
             }
@@ -555,7 +555,12 @@ async function startServer() {
           if (p) {
             p.rttMs = payload.rttMs || 0;
             p.clockOffsetMs = payload.clockOffsetMs || 0;
-            p.isSynced = Math.abs(p.clockOffsetMs) <= room.settings.maxAllowedDriftMs;
+            // Use the actual measured audio drift (how far buffer position is
+            // from expected) rather than raw NTP clock offset for the sync
+            // indicator.  Clock offset on WiFi is naturally large (50-100ms)
+            // even when audio is perfectly in sync.
+            const drift = payload.audioDriftMs !== undefined ? payload.audioDriftMs : p.clockOffsetMs;
+            p.isSynced = Math.abs(drift) <= room.settings.maxAllowedDriftMs;
             p.isBuffering = payload.isBuffering || false;
             broadcastRoomState(roomCode);
           }
