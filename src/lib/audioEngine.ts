@@ -498,10 +498,11 @@ class AudioEngine {
       const derivative = (error - this.pidLastDrift) / dt;
       this.pidLastDrift = error;
 
-      // Tuning parameters
-      const Kp = 0.00004;  // Proportional: Reacts to current error
-      const Ki = 0.000002; // Integral: Eliminates persistent offset
-      const Kd = 0.00001;  // Derivative: Dampens oscillation
+      // Tuning parameters - Aggressive enough to close a 100ms gap in ~2 seconds,
+      // but dampened enough to prevent 'wobble'.
+      const Kp = 0.0005;   // Proportional: 0.05 (5% speedup) at 100ms error
+      const Ki = 0.00005;  // Integral: Closes persistent hardware clock skews
+      const Kd = 0.00015;  // Derivative: Brakes hard when approaching 0 to stop oscillation
 
       const adjustment = (Kp * error) + (Ki * this.pidIntegral) + (Kd * derivative);
       
@@ -523,14 +524,19 @@ class AudioEngine {
 
     const source = this.ctx.createBufferSource();
     source.buffer = buffer;
-    source.playbackRate.value = rate;
+    source.playbackRate.value = this.activeBasePlaybackRate;
     source.connect(this.channelFilter!);
-    source.start(this.ctx.currentTime, targetPositionSec);
 
+    // When we start "now", it takes outputLatencySec for the sound to hit the speaker.
+    // By the time it hits the speaker, the expected position will have advanced.
+    const outputLatencySec = (this.ctx as any).outputLatency ?? this.ctx.baseLatency ?? 0;
+    const targetSpeakerPositionSec = targetPositionSec + (outputLatencySec * this.activeBasePlaybackRate);
+
+    source.start(this.ctx.currentTime, targetSpeakerPositionSec);
     this.scheduledAudioContextStartTime = this.ctx.currentTime;
-    this.scheduledAudioOffsetSec = targetPositionSec;
+    this.scheduledAudioOffsetSec = targetSpeakerPositionSec;
     // Reset position tracking to the resynced position
-    this.lastKnownBufferPos = targetPositionSec;
+    this.lastKnownBufferPos = targetSpeakerPositionSec;
     this.lastPosTrackCtxTime = this.ctx.currentTime;
     this.currentEffectiveRate = rate;
     
