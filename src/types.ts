@@ -80,6 +80,7 @@ export type WSMessageType =
   | 'ROLE_UPDATE'
   | 'LATENCY_REPORT'
   | 'QUEUE_UPDATE'
+  | 'LEAVE_ROOM'
   | 'USER_LEFT'
   | 'ERROR'
   | 'CALIBRATE_REQUEST';

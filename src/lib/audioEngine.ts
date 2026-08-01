@@ -34,6 +34,14 @@ class AudioEngine {
   private lastMeasuredDriftMs: number = 0;
   private clockSampleCount: number = 0;
 
+  // Rate-aware position tracking: because the drift correction loop changes the
+  // playback rate, we can't just use (ctx.currentTime - startTime) to know where
+  // the buffer actually is.  Instead we maintain a running accumulator that gets
+  // snapshotted every time the rate changes.
+  private lastKnownBufferPos: number = 0;
+  private lastPosTrackCtxTime: number = 0;
+  private currentEffectiveRate: number = 1.0;
+
   constructor() {
     // Lazy initialization on user interaction
   }
@@ -181,6 +189,22 @@ class AudioEngine {
     }
   }
 
+  // Snapshot the current buffer position, then apply the new rate.
+  // Using setValueAtTime (instant) instead of setTargetAtTime (exponential curve)
+  // so the position accumulator stays accurate — the tiny rate deltas (0.3–8%)
+  // are small enough to be inaudible as an instantaneous change.
+  private applyPlaybackRate(rate: number): void {
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+    const elapsed = Math.max(0, now - this.lastPosTrackCtxTime);
+    this.lastKnownBufferPos += elapsed * this.currentEffectiveRate;
+    this.lastPosTrackCtxTime = now;
+    this.currentEffectiveRate = rate;
+    if (this.currentSource) {
+      this.currentSource.playbackRate.setValueAtTime(rate, now);
+    }
+  }
+
   // Pre-fetch & decode audio buffer
   public async loadAudioBuffer(url: string, trackId: string): Promise<AudioBuffer> {
     if (this.audioBufferCache.has(trackId)) {
@@ -299,6 +323,10 @@ class AudioEngine {
       source.start(targetCtxTime, Math.max(0, startPositionOffsetSec));
       this.scheduledAudioContextStartTime = targetCtxTime;
       this.scheduledAudioOffsetSec = startPositionOffsetSec;
+      // Initialize rate-aware position tracking
+      this.lastKnownBufferPos = startPositionOffsetSec;
+      this.lastPosTrackCtxTime = targetCtxTime;
+      this.currentEffectiveRate = playbackRate;
     } else {
       // Late join / catch-up: Calculate current offset position in track
       const elapsedTrackSec = Math.abs(secUntilStart) * playbackRate;
@@ -308,6 +336,10 @@ class AudioEngine {
         source.start(ctx.currentTime, currentTrackPositionSec);
         this.scheduledAudioContextStartTime = ctx.currentTime;
         this.scheduledAudioOffsetSec = currentTrackPositionSec;
+        // Initialize rate-aware position tracking
+        this.lastKnownBufferPos = currentTrackPositionSec;
+        this.lastPosTrackCtxTime = ctx.currentTime;
+        this.currentEffectiveRate = playbackRate;
       }
     }
 
@@ -359,9 +391,11 @@ class AudioEngine {
         return;
       }
 
-      if (Math.abs(driftMs) < 6) {
-        // Within tolerance — ease back to nominal speed.
-        this.currentSource.playbackRate.setTargetAtTime(this.activeBasePlaybackRate, this.ctx.currentTime, 0.5);
+      if (Math.abs(driftMs) < 5) {
+        // Within tolerance — return to nominal speed.
+        if (this.currentEffectiveRate !== this.activeBasePlaybackRate) {
+          this.applyPlaybackRate(this.activeBasePlaybackRate);
+        }
         return;
       }
 
@@ -369,13 +403,13 @@ class AudioEngine {
       // same flat ~2% regardless of size. This is what closes small, slowly
       // accumulating gaps (real hardware clocks never run at exactly the same
       // speed on two devices) instead of perpetually chasing a moving target.
-      // Scaled and clamped to stay inaudible: 6ms -> ~0.3%, 100ms -> ~5%, 200ms cap ~8%.
+      // Scaled and clamped to stay inaudible: 5ms -> ~0.2%, 100ms -> ~4%, 200ms cap ~8%.
       const proportionalAdjustment = Math.min(0.08, Math.abs(driftMs) / 2500);
       const corrected = driftMs > 0
         ? this.activeBasePlaybackRate * (1 + proportionalAdjustment)
         : this.activeBasePlaybackRate * (1 - proportionalAdjustment);
-      this.currentSource.playbackRate.setTargetAtTime(corrected, this.ctx.currentTime, 0.3);
-    }, 700);
+      this.applyPlaybackRate(corrected);
+    }, 500);
   }
 
   private hardResync(targetPositionSec: number): void {
@@ -394,6 +428,10 @@ class AudioEngine {
 
     this.scheduledAudioContextStartTime = this.ctx.currentTime;
     this.scheduledAudioOffsetSec = targetPositionSec;
+    // Reset position tracking to the resynced position
+    this.lastKnownBufferPos = targetPositionSec;
+    this.lastPosTrackCtxTime = this.ctx.currentTime;
+    this.currentEffectiveRate = rate;
     this.currentSource = source;
 
     source.onended = () => {
@@ -412,8 +450,11 @@ class AudioEngine {
 
   public getCurrentTrackPosition(): number {
     if (!this.ctx || !this.currentSource) return 0;
-    const elapsedSinceStart = Math.max(0, this.ctx.currentTime - this.scheduledAudioContextStartTime);
-    return this.scheduledAudioOffsetSec + elapsedSinceStart;
+    // Use the rate-aware accumulator: lastKnownBufferPos is snapshotted every
+    // time the playback rate changes, so the elapsed-since-snapshot segment is
+    // always at a single known rate.
+    const elapsed = Math.max(0, this.ctx.currentTime - this.lastPosTrackCtxTime);
+    return this.lastKnownBufferPos + elapsed * this.currentEffectiveRate;
   }
 
   public getFrequencyData(): Uint8Array {
