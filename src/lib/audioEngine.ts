@@ -88,20 +88,26 @@ class AudioEngine {
     }
 
     // Under Cristian's algorithm, a faster round trip means less uncertainty
-    // in the "network delay was symmetric" assumption. Rather than a loose
-    // threshold that still lets a cluster of bad samples drag the median
-    // (and therefore the threshold) upward with them, keep only the
-    // consistently-fastest fraction of recent round trips and trust those —
-    // slow/jittery ones get outvoted entirely instead of partially counted.
+    // in the "network delay was symmetric" assumption. Real-world WiFi/mobile
+    // paths often have a fairly steady total RTT while the up/down split
+    // varies a lot between individual pings — a fixed top-N% cut can still
+    // include samples whose asymmetry just happened not to be the worst in
+    // the batch. Trusting only samples close to the single best round trip
+    // actually observed is the standard NTP min-filter approach and is more
+    // resistant to that specific noise pattern.
     const paired = this.rttHistory.map((rtt, i) => ({ rtt, offset: this.clockOffsets[i] }));
-    paired.sort((a, b) => a.rtt - b.rtt);
-    const keepCount = Math.max(3, Math.ceil(paired.length * 0.4));
-    const bestSamples = paired.slice(0, keepCount);
+    const minRtt = Math.min(...this.rttHistory);
+    let bestSamples = paired.filter((s) => s.rtt <= minRtt * 1.15);
+    if (bestSamples.length < 3) {
+      // Not enough close-to-best samples yet — fall back to the closest 3.
+      paired.sort((a, b) => a.rtt - b.rtt);
+      bestSamples = paired.slice(0, 3);
+    }
 
     if (bestSamples.length > 0) {
       const sum = bestSamples.reduce((acc, s) => acc + s.offset, 0);
       this.smoothedClockOffset = sum / bestSamples.length;
-      this.smoothedRTT = bestSamples[Math.floor(bestSamples.length / 2)].rtt;
+      this.smoothedRTT = minRtt;
     } else {
       this.smoothedClockOffset = clockOffsetMs;
       this.smoothedRTT = rttMs;
