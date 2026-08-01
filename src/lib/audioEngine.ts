@@ -334,19 +334,23 @@ class AudioEngine {
         return;
       }
 
-      if (Math.abs(driftMs) < 12) {
+      if (Math.abs(driftMs) < 6) {
         // Within tolerance — ease back to nominal speed.
         this.currentSource.playbackRate.setTargetAtTime(this.activeBasePlaybackRate, this.ctx.currentTime, 0.5);
         return;
       }
 
-      // Moderate drift: nudge playback speed by ~2% to pull back into sync over a
-      // couple of seconds, rather than an audible jump.
+      // Proportional correction: bigger drift gets a firmer nudge instead of the
+      // same flat ~2% regardless of size. This is what closes small, slowly
+      // accumulating gaps (real hardware clocks never run at exactly the same
+      // speed on two devices) instead of perpetually chasing a moving target.
+      // Scaled and clamped to stay inaudible: 6ms -> ~0.3%, 100ms -> ~5%, 200ms cap ~8%.
+      const proportionalAdjustment = Math.min(0.08, Math.abs(driftMs) / 2500);
       const corrected = driftMs > 0
-        ? this.activeBasePlaybackRate * 1.02
-        : this.activeBasePlaybackRate * 0.98;
+        ? this.activeBasePlaybackRate * (1 + proportionalAdjustment)
+        : this.activeBasePlaybackRate * (1 - proportionalAdjustment);
       this.currentSource.playbackRate.setTargetAtTime(corrected, this.ctx.currentTime, 0.3);
-    }, 1500);
+    }, 700);
   }
 
   private hardResync(targetPositionSec: number): void {
