@@ -121,6 +121,7 @@ async function startServer() {
 
   app.use(express.json());
 
+  // API endpoints
   app.get('/api/tracks', (_req, res) => {
     res.json(DEFAULT_TRACKS);
   });
@@ -134,6 +135,8 @@ async function startServer() {
     });
   });
 
+  // Accept a custom-uploaded audio file and store it in memory so every
+  // connected device (not just the uploader) can fetch it back over the network.
   app.post('/api/upload', express.raw({ type: '*/*', limit: '25mb' }), (req, res) => {
     if (!req.body || !(req.body instanceof Buffer) || req.body.length === 0) {
       res.status(400).json({ message: 'No file data received.' });
@@ -160,36 +163,40 @@ async function startServer() {
     res.send(file.data);
   });
 
+  // Simple WAV audio generator for synthetic test tracks if requested
   app.get('/api/audio/:filename', (req, res) => {
+    // Generate a simple PCM WAV audio response dynamically so playback works out-of-the-box
     const sampleRate = 44100;
-    const duration = 180;
+    const duration = 180; // 3 minutes
     const numSamples = sampleRate * duration;
-    const dataSize = numSamples * 2 * 2;
+    const dataSize = numSamples * 2 * 2; // 16-bit stereo
     const headerSize = 44;
     const totalSize = headerSize + dataSize;
-
+    
     const buffer = Buffer.alloc(headerSize);
-
+    
+    // RIFF header
     buffer.write('RIFF', 0);
     buffer.writeUInt32LE(totalSize - 8, 4);
     buffer.write('WAVE', 8);
     buffer.write('fmt ', 12);
-    buffer.writeUInt32LE(16, 16);
-    buffer.writeUInt16LE(1, 20);
-    buffer.writeUInt16LE(2, 22);
+    buffer.writeUInt32LE(16, 16); // PCM chunk size
+    buffer.writeUInt16LE(1, 20);  // Format PCM
+    buffer.writeUInt16LE(2, 22);  // Channels (2)
     buffer.writeUInt32LE(sampleRate, 24);
-    buffer.writeUInt32LE(sampleRate * 4, 28);
-    buffer.writeUInt16LE(4, 32);
-    buffer.writeUInt16LE(16, 34);
+    buffer.writeUInt32LE(sampleRate * 4, 28); // Byte rate
+    buffer.writeUInt16LE(4, 32);  // Block align
+    buffer.writeUInt16LE(16, 34); // Bits per sample
     buffer.write('data', 36);
     buffer.writeUInt32LE(dataSize, 40);
 
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Content-Length', totalSize.toString());
     res.setHeader('Accept-Ranges', 'bytes');
-
+    
     res.write(buffer);
 
+    // Stream tone & synth melody buffer chunks
     const chunkSize = 4096;
     let sampleOffset = 0;
 
@@ -207,19 +214,24 @@ async function startServer() {
         const currentSample = sampleOffset + i;
         const t = currentSample / sampleRate;
 
-        let baseFreq = 220;
+        // Base frequency sequence based on requested filename
+        let baseFreq = 220; // A3
         if (req.params.filename.includes('bass')) baseFreq = 110;
         if (req.params.filename.includes('chill')) baseFreq = 165;
 
+        // Simple chord progression synth melody
         const noteIndex = Math.floor(t * 2) % 4;
-        const scale = [1, 1.25, 1.5, 1.875];
+        const scale = [1, 1.25, 1.5, 1.875]; // Major chord ratios
         const freq = baseFreq * scale[noteIndex];
 
+        // Beat kick & snare synthesis
         const beatT = t % 0.5;
         const kick = Math.sin(2 * Math.PI * 60 * (1 - beatT * 2)) * Math.exp(-beatT * 10);
-
+        
+        // Synth melody sine wave with subtle chord harmonic
         const synth = Math.sin(2 * Math.PI * freq * t) * 0.3 + Math.sin(2 * Math.PI * freq * 2 * t) * 0.1;
 
+        // Combine
         let leftSample = Math.max(-1, Math.min(1, synth + kick * 0.4));
         let rightSample = Math.max(-1, Math.min(1, synth * 0.8 + kick * 0.4));
 
@@ -239,19 +251,24 @@ async function startServer() {
     });
   });
 
+  // WebSocket Server Setup attached to HTTP server
   const wss = new WebSocketServer({ server });
 
   function broadcastRoomState(roomCode: string) {
     const room = rooms.get(roomCode);
     if (!room) return;
 
-    const participantList = Array.from(room.participants.values());
+    const participantsById: Record<string, any> = {};
+    room.participants.forEach((p, id) => {
+      participantsById[id] = p;
+    });
+
     const payload = {
       code: room.code,
       name: room.name,
       hostId: room.hostId,
       createdAt: room.createdAt,
-      participants: participantList,
+      participants: participantsById,
       playback: room.playback,
       queue: room.queue,
       settings: room.settings
@@ -260,29 +277,6 @@ async function startServer() {
     const messageStr = JSON.stringify({
       type: 'ROOM_STATE_UPDATE',
       payload,
-      timestamp: Date.now()
-    });
-
-    clients.forEach((client) => {
-      if (client.roomCode === roomCode && client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(messageStr);
-      }
-    });
-  }
-
-  function broadcastSyncPlay(
-    roomCode: string,
-    syncPayload: {
-      playAt: number;
-      trackId: string | null;
-      audioUrl: string | null;
-      startPositionOffset: number;
-      playbackRate: number;
-    }
-  ) {
-    const messageStr = JSON.stringify({
-      type: 'sync_play',
-      payload: syncPayload,
       timestamp: Date.now()
     });
 
@@ -310,18 +304,7 @@ async function startServer() {
         const msg = JSON.parse(data.toString());
         const { type, payload } = msg;
 
-        if (type === 'ping_offset') {
-          ws.send(JSON.stringify({
-            type: 'pong_offset',
-            payload: {
-              seq: payload.seq,
-              serverTime: Date.now()
-            },
-            timestamp: Date.now()
-          }));
-          return;
-        }
-
+        // 1. Clock Sync Ping/Pong
         if (type === 'CLOCK_PING') {
           ws.send(JSON.stringify({
             type: 'CLOCK_PONG',
@@ -334,6 +317,7 @@ async function startServer() {
           return;
         }
 
+        // 2. Create Room
         if (type === 'CREATE_ROOM') {
           let code = generateRoomCode();
           while (rooms.has(code)) {
@@ -398,6 +382,7 @@ async function startServer() {
           return;
         }
 
+        // 3. Join Room
         if (type === 'JOIN_ROOM') {
           const roomCode = (payload.roomCode || '').toUpperCase().trim();
           const room = rooms.get(roomCode);
@@ -443,12 +428,14 @@ async function startServer() {
           return;
         }
 
+        // 4. Playback Commands (Play, Pause, Seek, Track Change)
         if (type === 'PLAYBACK_COMMAND') {
           const roomCode = connection.roomCode;
           if (!roomCode) return;
           const room = rooms.get(roomCode);
           if (!room) return;
 
+          // Check permissions: host or allowParticipantControl
           if (connection.role !== 'host' && !room.settings.allowParticipantControl) {
             ws.send(JSON.stringify({
               type: 'ERROR',
@@ -460,22 +447,14 @@ async function startServer() {
           const { action, track, position, playbackRate } = payload;
           const currentServerTime = Date.now();
           const bufferDelayMs = room.settings.bufferDurationMs || 4500;
-          const playAt = currentServerTime + 1000;
 
           if (action === 'PLAY') {
             room.playback.isPlaying = true;
             room.playback.startPositionOffset = position !== undefined ? position : room.playback.position;
             room.playback.serverScheduledTimestamp = currentServerTime + bufferDelayMs;
             room.playback.position = room.playback.startPositionOffset;
-
-            broadcastSyncPlay(roomCode, {
-              playAt,
-              trackId: room.playback.track?.id ?? null,
-              audioUrl: room.playback.track?.audioUrl ?? null,
-              startPositionOffset: room.playback.startPositionOffset,
-              playbackRate: room.playback.playbackRate
-            });
           } else if (action === 'PAUSE') {
+            // Calculate elapsed audio position before pausing
             if (room.playback.isPlaying && room.playback.serverScheduledTimestamp > 0) {
               const elapsedSec = Math.max(0, (currentServerTime - room.playback.serverScheduledTimestamp) / 1000);
               room.playback.position = room.playback.startPositionOffset + elapsedSec;
@@ -496,14 +475,6 @@ async function startServer() {
               room.playback.position = 0;
               room.playback.isPlaying = true;
               room.playback.serverScheduledTimestamp = currentServerTime + bufferDelayMs;
-
-              broadcastSyncPlay(roomCode, {
-                playAt,
-                trackId: track.id,
-                audioUrl: track.audioUrl,
-                startPositionOffset: 0,
-                playbackRate: room.playback.playbackRate
-              });
             }
           }
 
@@ -515,6 +486,7 @@ async function startServer() {
           return;
         }
 
+        // 5. Role or Channel Update
         if (type === 'ROLE_UPDATE') {
           const roomCode = connection.roomCode;
           if (!roomCode) return;
@@ -533,6 +505,7 @@ async function startServer() {
           return;
         }
 
+        // 6. Latency & Diagnostics Report from client
         if (type === 'LATENCY_REPORT') {
           const roomCode = connection.roomCode;
           if (!roomCode) return;
@@ -550,6 +523,7 @@ async function startServer() {
           return;
         }
 
+        // 7. Queue Update
         if (type === 'QUEUE_UPDATE') {
           const roomCode = connection.roomCode;
           if (!roomCode) return;
@@ -579,6 +553,7 @@ async function startServer() {
           if (room.participants.size === 0) {
             rooms.delete(roomCode);
           } else {
+            // If host left, assign new host
             if (room.hostId === clientId) {
               const nextHost = Array.from(room.participants.values())[0];
               if (nextHost) {
@@ -595,6 +570,7 @@ async function startServer() {
     });
   });
 
+  // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

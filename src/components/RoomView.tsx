@@ -596,8 +596,8 @@ export const RoomView: React.FC<RoomViewProps> = ({
               </div>
 
               <div className={`p-3 rounded-lg border ${isDarkMode ? 'border-white/10 bg-black/20' : 'border-zinc-200 bg-zinc-50'}`}>
-                <p className={`text-[11px] font-medium uppercase ${subtle}`}>Drift</p>
-                <p className="text-xl font-mono font-semibold mt-1">&lt;2 ms</p>
+                <p className={`text-[11px] font-medium uppercase ${subtle}`}>Output latency</p>
+                <p className="text-xl font-mono font-semibold mt-1">{Math.round(audioEngine.getOutputLatencyMs())} ms</p>
               </div>
             </div>
           </div>
