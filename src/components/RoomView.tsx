@@ -30,6 +30,7 @@ export const RoomView: React.FC<RoomViewProps> = ({
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [trackPositionSec, setTrackPositionSec] = useState<number>(0);
   const [startingInMs, setStartingInMs] = useState<number>(0);
+  const [manualOffsetMs, setManualOffsetMs] = useState<number>(audioEngine.getManualSyncOffset());
 
   const me = room.participants[myClientId];
   const isHost = room.hostId === myClientId;
@@ -112,6 +113,12 @@ export const RoomView: React.FC<RoomViewProps> = ({
         position: trackPositionSec
       });
     }
+  };
+
+  const handleManualOffsetChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseInt(e.target.value, 10);
+    setManualOffsetMs(val);
+    audioEngine.setManualSyncOffset(val);
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -609,6 +616,39 @@ export const RoomView: React.FC<RoomViewProps> = ({
               <div className={`p-3 rounded-lg border ${isDarkMode ? 'border-white/10 bg-black/20' : 'border-zinc-200 bg-zinc-50'}`}>
                 <p className={`text-[11px] font-medium uppercase ${subtle}`}>Output latency</p>
                 <p className="text-xl font-mono font-semibold mt-1">{Math.round(audioEngine.getOutputLatencyMs())} ms</p>
+              </div>
+            </div>
+
+            {/* Manual Sync Calibration */}
+            <div className={`p-4 rounded-xl border mt-4 ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-zinc-200 bg-white'}`}>
+              <div className="flex justify-between items-center mb-4">
+                <div>
+                  <h4 className="font-medium text-sm">Manual Sync Calibration</h4>
+                  <p className={`text-xs mt-1 ${subtle}`}>Fix asymmetric internet delay</p>
+                </div>
+                <div className="text-right">
+                  <span className={`text-sm font-mono font-medium ${manualOffsetMs > 0 ? (isDarkMode ? 'text-amber-400' : 'text-amber-600') : manualOffsetMs < 0 ? (isDarkMode ? 'text-blue-400' : 'text-blue-600') : ''}`}>
+                    {manualOffsetMs > 0 ? `+${manualOffsetMs}` : manualOffsetMs} ms
+                  </span>
+                </div>
+              </div>
+              <input
+                type="range"
+                min="-200"
+                max="200"
+                step="5"
+                value={manualOffsetMs}
+                onChange={handleManualOffsetChange}
+                className="w-full h-2 rounded-lg appearance-none cursor-pointer"
+                style={{
+                  background: isDarkMode ? '#3f3f46' : '#e4e4e7',
+                  accentColor: isDarkMode ? '#3b82f6' : '#2563eb'
+                }}
+              />
+              <div className={`flex justify-between text-[10px] mt-2 font-medium uppercase ${subtle}`}>
+                <span>Audio Slower</span>
+                <span>Normal</span>
+                <span>Audio Faster</span>
               </div>
             </div>
           </div>

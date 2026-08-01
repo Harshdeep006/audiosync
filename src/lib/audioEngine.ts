@@ -132,6 +132,9 @@ class AudioEngine {
   private pidIntegral: number = 0;
   private pidLastDrift: number = 0;
 
+  // Manual calibration to fix asymmetric internet routing (where ping up != ping down)
+  private manualSyncOffsetMs: number = 0;
+
   constructor() {
     // Lazy initialization on user interaction
   }
@@ -182,15 +185,23 @@ class AudioEngine {
   }
 
   public getEstimatedServerTime(): number {
-    return this.clockModel.predictServerTime(Date.now());
+    return this.clockModel.predictServerTime(Date.now()) + this.manualSyncOffsetMs;
   }
 
   public getSmoothedOffset(): number {
-    return this.clockModel.getSmoothedOffset();
+    return this.clockModel.getSmoothedOffset() + this.manualSyncOffsetMs;
   }
 
   public getSmoothedRTT(): number {
     return this.clockModel.getSmoothedRTT();
+  }
+
+  public setManualSyncOffset(offsetMs: number): void {
+    this.manualSyncOffsetMs = offsetMs;
+  }
+
+  public getManualSyncOffset(): number {
+    return this.manualSyncOffsetMs;
   }
 
   // Role-Based Audio Frequency & Panning Separation
@@ -435,8 +446,16 @@ class AudioEngine {
       const estServerTime = this.getEstimatedServerTime();
       const elapsedServerSec = Math.max(0, (estServerTime - this.activeServerScheduledTimestampMs) / 1000);
       const expectedPositionSec = this.activeStartPositionOffsetSec + elapsedServerSec * this.activeBasePlaybackRate;
-      const actualPositionSec = this.getCurrentTrackPosition();
-      const rawDriftMs = (expectedPositionSec - actualPositionSec) * 1000;
+      
+      const bufferPositionSec = this.getCurrentTrackPosition();
+      // HUGE FIX: The buffer position is NOT the speaker position! It takes outputLatency
+      // seconds for the audio graph to reach the physical speaker hardware. 
+      // If we don't subtract this, the drift loop will actively *force* the audio to be 
+      // out of sync by exactly the device's hardware latency!
+      const outputLatencySec = (this.ctx as any).outputLatency ?? this.ctx.baseLatency ?? 0;
+      const speakerPositionSec = bufferPositionSec - outputLatencySec;
+      
+      const rawDriftMs = (expectedPositionSec - speakerPositionSec) * 1000;
 
       // Large jump — bypass smoothing and hard-resync immediately.
       if (Math.abs(rawDriftMs) > 200) {
