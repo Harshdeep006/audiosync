@@ -78,26 +78,34 @@ class AudioEngine {
     this.clockSampleCount++;
 
     this.rttHistory.push(rttMs);
-    if (this.rttHistory.length > 10) this.rttHistory.shift();
-
     this.clockOffsets.push(clockOffsetMs);
-    if (this.clockOffsets.length > 10) this.clockOffsets.shift();
-
-    // Filter outliers based on RTT median
-    const sortedRtt = [...this.rttHistory].sort((a, b) => a - b);
-    const medianRtt = sortedRtt[Math.floor(sortedRtt.length / 2)] || rttMs;
-
-    // Use samples with lowest RTT for maximum offset accuracy
-    const validSamples = this.clockOffsets.filter((_, idx) => this.rttHistory[idx] <= medianRtt * 1.8);
-    
-    if (validSamples.length > 0) {
-      const sum = validSamples.reduce((acc, val) => acc + val, 0);
-      this.smoothedClockOffset = sum / validSamples.length;
-    } else {
-      this.smoothedClockOffset = clockOffsetMs;
+    // A wider window resists a jittery connection (occasional RTT spikes)
+    // dominating the average; the burst/warm-up pings still get us enough
+    // samples fast, this just stops one bad reading from swinging things.
+    if (this.rttHistory.length > 30) {
+      this.rttHistory.shift();
+      this.clockOffsets.shift();
     }
 
-    this.smoothedRTT = medianRtt;
+    // Under Cristian's algorithm, a faster round trip means less uncertainty
+    // in the "network delay was symmetric" assumption. Rather than a loose
+    // threshold that still lets a cluster of bad samples drag the median
+    // (and therefore the threshold) upward with them, keep only the
+    // consistently-fastest fraction of recent round trips and trust those —
+    // slow/jittery ones get outvoted entirely instead of partially counted.
+    const paired = this.rttHistory.map((rtt, i) => ({ rtt, offset: this.clockOffsets[i] }));
+    paired.sort((a, b) => a.rtt - b.rtt);
+    const keepCount = Math.max(3, Math.ceil(paired.length * 0.4));
+    const bestSamples = paired.slice(0, keepCount);
+
+    if (bestSamples.length > 0) {
+      const sum = bestSamples.reduce((acc, s) => acc + s.offset, 0);
+      this.smoothedClockOffset = sum / bestSamples.length;
+      this.smoothedRTT = bestSamples[Math.floor(bestSamples.length / 2)].rtt;
+    } else {
+      this.smoothedClockOffset = clockOffsetMs;
+      this.smoothedRTT = rttMs;
+    }
   }
 
   public getEstimatedServerTime(): number {
