@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Radio, QrCode, Sliders, Cpu, ArrowRight, Play, Pause, ShieldCheck } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Radio, QrCode, Sliders, Cpu, ArrowRight, Play, Pause, ShieldCheck, Wifi } from 'lucide-react';
 import { audioEngine } from '../lib/audioEngine';
 import { AudioChannelRole } from '../types';
 
@@ -28,6 +28,27 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [joinInputCode, setJoinInputCode] = useState<string>('');
   const [isPlayingSampler, setIsPlayingSampler] = useState<boolean>(false);
   const [samplerRole, setSamplerRole] = useState<AudioChannelRole>('full');
+  const [lanAddresses, setLanAddresses] = useState<string[]>([]);
+  const [lanPort, setLanPort] = useState<number | null>(null);
+
+  useEffect(() => {
+    fetch('/api/local-network-info')
+      .then((res) => res.json())
+      .then((data) => {
+        // A cloud host (like Render) also has its own internal network
+        // interfaces, so just "addresses exist" isn't enough — only show
+        // this when the page is actually being accessed via one of those
+        // local addresses (i.e., this server is genuinely running on
+        // someone's own machine, not deployed remotely).
+        if (data.isLikelyLocal && data.addresses && data.addresses.length > 0) {
+          setLanAddresses(data.addresses);
+          setLanPort(data.port);
+        }
+      })
+      .catch(() => {
+        // Silently ignore — this is a nice-to-have, not critical.
+      });
+  }, []);
 
   const handleToggleSampler = async () => {
     if (isPlayingSampler) {
@@ -82,6 +103,20 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           <p className={`mt-5 text-base sm:text-lg max-w-xl mx-auto ${isDarkMode ? 'text-zinc-400' : 'text-zinc-500'}`}>
             Sync playback across phones, tablets, and laptops to within milliseconds using clock-aligned WebSocket scheduling.
           </p>
+
+          {lanAddresses.length > 0 && (
+            <div className={`mt-6 inline-flex flex-col items-center gap-1 px-4 py-3 rounded-xl border max-w-md mx-auto ${
+              isDarkMode ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-emerald-300 bg-emerald-50'
+            }`}>
+              <p className={`text-xs font-medium flex items-center gap-1.5 ${isDarkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>
+                <Wifi size={13} /> Running in local network mode
+              </p>
+              <p className={`text-xs ${isDarkMode ? 'text-zinc-400' : 'text-zinc-600'}`}>
+                Devices on this same WiFi can join at{' '}
+                <span className="font-mono">http://{lanAddresses[0]}{lanPort ? `:${lanPort}` : ''}</span>
+              </p>
+            </div>
+          )}
 
           {/* Actions */}
           <div className="mt-10 grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-xl mx-auto text-left">

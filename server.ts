@@ -1,6 +1,7 @@
 import express from 'express';
 import http from 'http';
 import path from 'path';
+import os from 'os';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 
@@ -105,6 +106,21 @@ const rooms = new Map<string, RoomServer>();
 const clients = new Map<string, ClientConnection>();
 const uploadedAudioFiles = new Map<string, { data: Buffer; contentType: string }>();
 
+function getLocalNetworkAddresses(): string[] {
+  const interfaces = os.networkInterfaces();
+  const addresses: string[] = [];
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] || []) {
+      // IPv4, non-internal (skips 127.0.0.1) — these are the addresses other
+      // devices on the same WiFi/LAN can actually reach this machine at.
+      if (iface.family === 'IPv4' && !iface.internal) {
+        addresses.push(iface.address);
+      }
+    }
+  }
+  return addresses;
+}
+
 function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -124,6 +140,18 @@ async function startServer() {
   // API endpoints
   app.get('/api/tracks', (_req, res) => {
     res.json(DEFAULT_TRACKS);
+  });
+
+  // Lets the frontend show "guests on your WiFi can join at ..." when this
+  // server is being run locally (e.g. on a host's own laptop) rather than
+  // deployed to a public host like Render — same code, either way.
+  app.get('/api/local-network-info', (req, res) => {
+    const addresses = getLocalNetworkAddresses();
+    res.json({
+      addresses,
+      port: PORT,
+      isLikelyLocal: req.hostname === 'localhost' || addresses.includes(req.hostname)
+    });
   });
 
   app.get('/api/health', (_req, res) => {
@@ -587,6 +615,11 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`AudioSync full-stack server running on http://0.0.0.0:${PORT}`);
+    const lanAddresses = getLocalNetworkAddresses();
+    if (lanAddresses.length > 0) {
+      console.log('Devices on your WiFi/LAN can join at:');
+      lanAddresses.forEach((addr) => console.log(`  http://${addr}:${PORT}`));
+    }
   });
 }
 
