@@ -30,6 +30,7 @@ class AudioEngine {
   private activeServerScheduledTimestampMs: number = 0;
   private activeStartPositionOffsetSec: number = 0;
   private activeBasePlaybackRate: number = 1.0;
+  private frozenOffsetAtScheduleMs: number = 0;
   private lastMeasuredDriftMs: number = 0;
   private clockSampleCount: number = 0;
 
@@ -285,6 +286,12 @@ class AudioEngine {
     this.activeServerScheduledTimestampMs = serverScheduledTimestampMs;
     this.activeStartPositionOffsetSec = startPositionOffsetSec;
     this.activeBasePlaybackRate = playbackRate;
+    // Freeze the offset used to judge "elapsed time" for this playback session.
+    // The live offset estimate keeps getting re-measured in the background and
+    // genuinely wanders with real network jitter — re-deriving "expected
+    // position" from whatever it currently reads would mean chasing a moving
+    // target instead of correcting for real hardware clock-rate drift.
+    this.frozenOffsetAtScheduleMs = this.smoothedClockOffset;
 
     if (secUntilStart > 0) {
       // Future scheduling: Start audio at exact context time in future
@@ -334,7 +341,11 @@ class AudioEngine {
       const sinceActualStartSec = this.ctx.currentTime - this.scheduledAudioContextStartTime;
       if (sinceActualStartSec < 1.0) return;
 
-      const estServerTime = this.getEstimatedServerTime();
+      // Use the offset frozen at schedule time, not the live estimate — the
+      // live one keeps getting re-measured and genuinely wanders with real
+      // network jitter, which would otherwise make this comparison chase a
+      // moving target instead of tracking real elapsed time.
+      const estServerTime = Date.now() + this.frozenOffsetAtScheduleMs;
       const elapsedServerSec = Math.max(0, (estServerTime - this.activeServerScheduledTimestampMs) / 1000);
       const expectedPositionSec = this.activeStartPositionOffsetSec + elapsedServerSec * this.activeBasePlaybackRate;
       const actualPositionSec = this.getCurrentTrackPosition();
