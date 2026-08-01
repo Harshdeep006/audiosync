@@ -30,6 +30,7 @@ class AudioEngine {
   private activeServerScheduledTimestampMs: number = 0;
   private activeStartPositionOffsetSec: number = 0;
   private activeBasePlaybackRate: number = 1.0;
+  private lastMeasuredDriftMs: number = 0;
 
   constructor() {
     // Lazy initialization on user interaction
@@ -314,6 +315,7 @@ class AudioEngine {
       const expectedPositionSec = this.activeStartPositionOffsetSec + elapsedServerSec * this.activeBasePlaybackRate;
       const actualPositionSec = this.getCurrentTrackPosition();
       const driftMs = (expectedPositionSec - actualPositionSec) * 1000;
+      this.lastMeasuredDriftMs = driftMs;
 
       if (Math.abs(driftMs) > 200) {
         // Large drift — likely a throttled/backgrounded tab or a network stall.
@@ -402,6 +404,10 @@ class AudioEngine {
     if (!this.ctx) return 0;
     const latencySec = (this.ctx as any).outputLatency ?? this.ctx.baseLatency ?? 0;
     return latencySec * 1000;
+  }
+
+  public getLastMeasuredDriftMs(): number {
+    return this.lastMeasuredDriftMs;
   }
 }
 

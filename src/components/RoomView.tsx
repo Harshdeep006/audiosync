@@ -591,8 +591,10 @@ export const RoomView: React.FC<RoomViewProps> = ({
               </div>
 
               <div className={`p-3 rounded-lg border ${isDarkMode ? 'border-white/10 bg-black/20' : 'border-zinc-200 bg-zinc-50'}`}>
-                <p className={`text-[11px] font-medium uppercase ${subtle}`}>Buffer health</p>
-                <p className="text-xl font-mono font-semibold mt-1 text-emerald-500">100%</p>
+                <p className={`text-[11px] font-medium uppercase ${subtle}`}>Live drift</p>
+                <p className={`text-xl font-mono font-semibold mt-1 ${Math.abs(audioEngine.getLastMeasuredDriftMs()) > 100 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                  {Math.round(audioEngine.getLastMeasuredDriftMs()) >= 0 ? '+' : ''}{Math.round(audioEngine.getLastMeasuredDriftMs())} ms
+                </p>
               </div>
 
               <div className={`p-3 rounded-lg border ${isDarkMode ? 'border-white/10 bg-black/20' : 'border-zinc-200 bg-zinc-50'}`}>
