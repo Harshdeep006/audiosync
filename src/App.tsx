@@ -97,7 +97,10 @@ export default function App() {
   };
 
   const handleLeaveRoom = () => {
+    audioEngine.stopPlayback();
+    socketClient.leaveRoom();
     setCurrentRoom(null);
+    setMyClientId('');
     window.history.pushState({}, '', window.location.pathname);
   };
 
@@ -160,6 +163,7 @@ export default function App() {
         isOpen={isQRModalOpen}
         onClose={() => setIsQRModalOpen(false)}
         roomCode={currentRoom?.code || ''}
+        isDarkMode={isDarkMode}
       />
 
       <ArchitectureModal

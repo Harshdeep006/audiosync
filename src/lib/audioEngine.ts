@@ -352,14 +352,14 @@ class AudioEngine {
       const driftMs = (expectedPositionSec - actualPositionSec) * 1000;
       this.lastMeasuredDriftMs = driftMs;
 
-      if (Math.abs(driftMs) > 200) {
+      if (Math.abs(driftMs) > 80) {
         // Large drift — likely a throttled/backgrounded tab or a network stall.
         // A gentle rate nudge would take too long to catch up audibly; jump instead.
         this.hardResync(expectedPositionSec);
         return;
       }
 
-      if (Math.abs(driftMs) < 6) {
+      if (Math.abs(driftMs) < 3) {
         // Within tolerance — ease back to nominal speed.
         this.currentSource.playbackRate.setTargetAtTime(this.activeBasePlaybackRate, this.ctx.currentTime, 0.5);
         return;
@@ -375,7 +375,7 @@ class AudioEngine {
         ? this.activeBasePlaybackRate * (1 + proportionalAdjustment)
         : this.activeBasePlaybackRate * (1 - proportionalAdjustment);
       this.currentSource.playbackRate.setTargetAtTime(corrected, this.ctx.currentTime, 0.3);
-    }, 700);
+    }, 250);
   }
 
   private hardResync(targetPositionSec: number): void {

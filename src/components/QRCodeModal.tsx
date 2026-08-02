@@ -6,9 +6,10 @@ interface QRCodeModalProps {
   isOpen: boolean;
   onClose: () => void;
   roomCode: string;
+  isDarkMode?: boolean;
 }
 
-export const QRCodeModal: React.FC<QRCodeModalProps> = ({ isOpen, onClose, roomCode }) => {
+export const QRCodeModal: React.FC<QRCodeModalProps> = ({ isOpen, onClose, roomCode, isDarkMode = true }) => {
   const [qrUrl, setQrUrl] = useState<string>('');
   const [copied, setCopied] = useState<boolean>(false);
 
@@ -39,18 +40,22 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({ isOpen, onClose, roomC
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-      <div className="relative w-full max-w-sm rounded-xl bg-[#0e0e10] border border-white/10 p-6 text-white">
+      <div className={`relative w-full max-w-sm rounded-xl border p-6 ${
+        isDarkMode ? 'bg-[#0e0e10] border-white/10 text-white' : 'bg-white border-zinc-200 text-zinc-900'
+      }`}>
         <button
           onClick={onClose}
-          className="absolute top-4 right-4 p-1.5 rounded-md text-zinc-500 hover:text-white hover:bg-white/5 transition"
+          className={`absolute top-4 right-4 p-1.5 rounded-md transition ${
+            isDarkMode ? 'text-zinc-500 hover:text-white hover:bg-white/5' : 'text-zinc-400 hover:text-zinc-900 hover:bg-zinc-100'
+          }`}
         >
           <X size={18} />
         </button>
 
         <div className="text-center mb-5">
           <h3 className="text-lg font-semibold tracking-tight">Scan to join</h3>
-          <p className="text-sm text-zinc-500 mt-1">
-            Scan this code or enter room code <span className="font-mono text-zinc-300">{roomCode}</span>
+          <p className={`text-sm mt-1 ${isDarkMode ? 'text-zinc-500' : 'text-zinc-500'}`}>
+            Scan this code or enter room code <span className={`font-mono ${isDarkMode ? 'text-zinc-300' : 'text-zinc-700'}`}>{roomCode}</span>
           </p>
         </div>
 
@@ -65,16 +70,22 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({ isOpen, onClose, roomC
           <p className="text-2xl font-mono font-semibold text-zinc-900 tracking-wider mt-3">{roomCode}</p>
         </div>
 
-        <div className="mt-4 flex items-center gap-2 bg-black/30 p-2 rounded-lg border border-white/10">
+        <div className={`mt-4 flex items-center gap-2 p-2 rounded-lg border ${
+          isDarkMode ? 'bg-black/30 border-white/10' : 'bg-zinc-50 border-zinc-200'
+        }`}>
           <input
             type="text"
             readOnly
             value={joinUrl}
-            className="w-full bg-transparent text-xs text-zinc-400 font-mono px-2 focus:outline-none truncate"
+            className={`w-full bg-transparent text-xs font-mono px-2 focus:outline-none truncate ${
+              isDarkMode ? 'text-zinc-400' : 'text-zinc-600'
+            }`}
           />
           <button
             onClick={handleCopyLink}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-black font-medium text-xs transition shrink-0 hover:bg-zinc-200"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium text-xs transition shrink-0 ${
+              isDarkMode ? 'bg-white text-black hover:bg-zinc-200' : 'bg-zinc-900 text-white hover:bg-zinc-700'
+            }`}
           >
             {copied ? (
               <>

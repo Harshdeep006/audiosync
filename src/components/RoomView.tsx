@@ -75,6 +75,14 @@ export const RoomView: React.FC<RoomViewProps> = ({
     });
   }, [room.queue]);
 
+  // Eagerly preload the *current* track whenever it changes — covers
+  // late-joining devices and custom uploads that weren't in the original queue.
+  useEffect(() => {
+    if (currentTrack) {
+      audioEngine.loadAudioBuffer(currentTrack.audioUrl, currentTrack.id).catch(() => {});
+    }
+  }, [currentTrack?.id, currentTrack?.audioUrl]);
+
   useEffect(() => {
     if (currentTrack) {
       if (isPlaying && room.playback.serverScheduledTimestamp > 0) {
@@ -116,8 +124,8 @@ export const RoomView: React.FC<RoomViewProps> = ({
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newPos = parseFloat(e.target.value);
-    setTrackPositionSec(newPos);
     if (isHost || room.settings.allowParticipantControl) {
+      setTrackPositionSec(newPos);
       socketClient.send('PLAYBACK_COMMAND', {
         action: 'SEEK',
         position: newPos
@@ -452,8 +460,9 @@ export const RoomView: React.FC<RoomViewProps> = ({
                     <span className="flex items-center gap-1">
                       <Wifi size={11} /> {p.rttMs}ms
                     </span>
-                    <span className="flex items-center gap-1 text-emerald-500">
-                      <span className="w-1 h-1 rounded-full bg-emerald-500" /> Synced
+                    <span className={`flex items-center gap-1 ${p.isBuffering ? 'text-amber-500' : p.isSynced ? 'text-emerald-500' : 'text-rose-500'}`}>
+                      <span className={`w-1 h-1 rounded-full ${p.isBuffering ? 'bg-amber-500' : p.isSynced ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                      {p.isBuffering ? 'Buffering' : p.isSynced ? 'Synced' : 'Drifted'}
                     </span>
                   </div>
                 </div>

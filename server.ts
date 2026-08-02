@@ -104,7 +104,18 @@ const DEFAULT_TRACKS: AudioTrackServer[] = [
 
 const rooms = new Map<string, RoomServer>();
 const clients = new Map<string, ClientConnection>();
-const uploadedAudioFiles = new Map<string, { data: Buffer; contentType: string }>();
+const uploadedAudioFiles = new Map<string, { data: Buffer; contentType: string; uploadedAt: number }>();
+
+// Automatically evict uploaded files older than 2 hours to prevent memory leaks.
+const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, file] of uploadedAudioFiles) {
+    if (now - file.uploadedAt > UPLOAD_TTL_MS) {
+      uploadedAudioFiles.delete(id);
+    }
+  }
+}, 10 * 60 * 1000);
 
 function getLocalNetworkAddresses(): string[] {
   const interfaces = os.networkInterfaces();
@@ -173,7 +184,7 @@ async function startServer() {
 
     const id = 'upload_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const contentType = req.headers['content-type']?.toString() || 'audio/mpeg';
-    uploadedAudioFiles.set(id, { data: req.body, contentType });
+    uploadedAudioFiles.set(id, { data: req.body, contentType, uploadedAt: Date.now() });
 
     res.json({ id, url: `/api/uploads/${id}` });
   });
@@ -375,7 +386,7 @@ async function startServer() {
             settings: {
               autoSyncEnabled: true,
               maxAllowedDriftMs: 15,
-              bufferDurationMs: 4500,
+              bufferDurationMs: 800,
               allowParticipantControl: false
             }
           };
@@ -474,7 +485,15 @@ async function startServer() {
 
           const { action, track, position, playbackRate } = payload;
           const currentServerTime = Date.now();
-          const bufferDelayMs = room.settings.bufferDurationMs || 4500;
+
+          // Adaptive buffer: scale from actual network conditions instead of a
+          // fixed constant.  Use 3× the worst participant RTT + 200 ms headroom
+          // so every device has time to receive the message and schedule audio,
+          // but clamp to [300, 3000] ms to stay sane on both LAN and WAN.
+          let maxRtt = 0;
+          room.participants.forEach(p => { if (p.rttMs > maxRtt) maxRtt = p.rttMs; });
+          const adaptiveBuffer = Math.max(300, Math.min(3000, maxRtt * 3 + 200));
+          const bufferDelayMs = Math.max(adaptiveBuffer, room.settings.bufferDurationMs || 800);
 
           if (action === 'PLAY') {
             room.playback.isPlaying = true;
@@ -561,6 +580,33 @@ async function startServer() {
           if (payload.queue) {
             room.queue = payload.queue;
             broadcastRoomState(roomCode);
+          }
+          return;
+        }
+
+        // 8. Leave Room (graceful exit without closing WebSocket)
+        if (type === 'LEAVE_ROOM') {
+          const roomCode = connection.roomCode;
+          if (!roomCode) return;
+          connection.roomCode = null;
+
+          const room = rooms.get(roomCode);
+          if (room) {
+            room.participants.delete(clientId);
+            if (room.participants.size === 0) {
+              rooms.delete(roomCode);
+            } else {
+              if (room.hostId === clientId) {
+                const nextHost = Array.from(room.participants.values())[0];
+                if (nextHost) {
+                  room.hostId = nextHost.id;
+                  nextHost.role = 'host';
+                  const nextClient = clients.get(nextHost.id);
+                  if (nextClient) nextClient.role = 'host';
+                }
+              }
+              broadcastRoomState(roomCode);
+            }
           }
           return;
         }

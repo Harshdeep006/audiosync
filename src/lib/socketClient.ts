@@ -1,5 +1,5 @@
 import { audioEngine } from './audioEngine';
-import { ClockSyncResult, Room, WSMessage, WSMessageType } from '../types';
+import { ClockSyncResult, WSMessage, WSMessageType } from '../types';
 
 type MessageHandler = (msg: WSMessage) => void;
 
@@ -11,6 +11,7 @@ class SocketClient {
   private isConnected: boolean = false;
   private roomCode: string | null = null;
   private myClientId: string | null = null;
+  private reconnectAttempt: number = 0;
 
   constructor() {
     // Auto initialize socket on startup
@@ -30,6 +31,7 @@ class SocketClient {
 
       this.ws.onopen = () => {
         this.isConnected = true;
+        this.reconnectAttempt = 0;
         this.startClockSyncLoop();
         this.startLatencyReportingLoop();
       };
@@ -46,8 +48,10 @@ class SocketClient {
       this.ws.onclose = () => {
         this.isConnected = false;
         this.stopLoops();
-        // Reconnect after 2 seconds
-        setTimeout(() => this.connect(), 2000);
+        // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s
+        const delay = Math.min(30000, 2000 * Math.pow(2, this.reconnectAttempt));
+        this.reconnectAttempt++;
+        setTimeout(() => this.connect(), delay);
       };
 
       this.ws.onerror = (err) => {
@@ -169,6 +173,13 @@ class SocketClient {
 
   public getMyClientId(): string | null {
     return this.myClientId;
+  }
+
+  public leaveRoom(): void {
+    if (this.roomCode) {
+      this.send('LEAVE_ROOM', { roomCode: this.roomCode });
+      this.roomCode = null;
+    }
   }
 
   public getRoomCode(): string | null {
