@@ -12,6 +12,9 @@ class SocketClient {
   private roomCode: string | null = null;
   private myClientId: string | null = null;
   private reconnectAttempt: number = 0;
+  
+  // Keep recent RTTs for statistical outlier rejection (IQR)
+  private recentRtts: number[] = [];
 
   constructor() {
     // Auto initialize socket on startup
@@ -74,6 +77,29 @@ class SocketClient {
       const estimatedServerTime = serverTime + rttMs / 2;
       const clockOffsetMs = estimatedServerTime - clientReceiveTime;
 
+      // Statistical Outlier Rejection using Interquartile Range (IQR)
+      // On the open internet, random routing hiccups can cause a ping to take
+      // 500ms when the average is 50ms. If we let that into the clock model,
+      // it skews the regression. We identify and drop these spikes entirely.
+      this.recentRtts.push(rttMs);
+      if (this.recentRtts.length > 20) {
+        this.recentRtts.shift();
+      }
+
+      if (this.recentRtts.length >= 10) {
+        const sorted = [...this.recentRtts].sort((a, b) => a - b);
+        const q1 = sorted[Math.floor(sorted.length * 0.25)];
+        const q3 = sorted[Math.floor(sorted.length * 0.75)];
+        const iqr = q3 - q1;
+        // Strict upper bound for latency spikes (1.5x IQR is standard)
+        const upperBound = q3 + 1.5 * iqr;
+        
+        if (rttMs > upperBound && rttMs > 100) {
+          // Reject this sample, it's a network lag spike
+          return;
+        }
+      }
+
       const sample: ClockSyncResult = {
         clientSendTime,
         serverTime,
@@ -98,24 +124,23 @@ class SocketClient {
   private startClockSyncLoop(): void {
     if (this.pingIntervalId) clearInterval(this.pingIntervalId);
 
-    // Initial rapid burst of 10 pings for fast first-pass calibration —
-    // the very first pings after a fresh connection tend to be noisy
-    // (TLS handshake overhead, a cold server waking up), so more samples
-    // up front means outliers get outvoted quickly instead of lingering.
-    for (let i = 0; i < 10; i++) {
-      setTimeout(() => this.sendClockPing(), i * 200);
+    // Initial rapid burst of 20 pings for fast first-pass calibration —
+    // The Linear Regression model needs points to draw a line. A faster,
+    // larger initial burst warms up the PID controller much faster.
+    for (let i = 0; i < 20; i++) {
+      setTimeout(() => this.sendClockPing(), i * 100);
     }
 
-    // Fast warm-up cadence for the first ~10 seconds while the offset is
-    // still settling, then ease back to a lighter steady-state interval.
+    // Fast warm-up cadence for the first ~15 seconds while the regression
+    // settles, then ease back to a lighter steady-state interval.
     let warmupPings = 0;
     const warmupIntervalId = setInterval(() => {
       this.sendClockPing();
       warmupPings++;
-      if (warmupPings >= 12) {
+      if (warmupPings >= 20) {
         clearInterval(warmupIntervalId);
       }
-    }, 800);
+    }, 700);
 
     // Continuous NTP clock alignment every 2.5 seconds, ongoing
     this.pingIntervalId = setInterval(() => {
@@ -131,6 +156,7 @@ class SocketClient {
         this.send('LATENCY_REPORT', {
           rttMs: audioEngine.getSmoothedRTT(),
           clockOffsetMs: audioEngine.getSmoothedOffset(),
+          audioDriftMs: audioEngine.getLastMeasuredDriftMs(),
           isBuffering: audioEngine.getIsLoadingTrack()
         });
       }
