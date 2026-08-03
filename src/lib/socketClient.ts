@@ -1,5 +1,5 @@
 import { audioEngine } from './audioEngine';
-import { ClockSyncResult, WSMessage, WSMessageType } from '../types';
+import { ClockSyncResult, Room, WSMessage, WSMessageType } from '../types';
 
 type MessageHandler = (msg: WSMessage) => void;
 
@@ -11,10 +11,6 @@ class SocketClient {
   private isConnected: boolean = false;
   private roomCode: string | null = null;
   private myClientId: string | null = null;
-  private reconnectAttempt: number = 0;
-  
-  // Keep recent RTTs for statistical outlier rejection (IQR)
-  private recentRtts: number[] = [];
 
   constructor() {
     // Auto initialize socket on startup
@@ -34,7 +30,6 @@ class SocketClient {
 
       this.ws.onopen = () => {
         this.isConnected = true;
-        this.reconnectAttempt = 0;
         this.startClockSyncLoop();
         this.startLatencyReportingLoop();
       };
@@ -51,10 +46,8 @@ class SocketClient {
       this.ws.onclose = () => {
         this.isConnected = false;
         this.stopLoops();
-        // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s
-        const delay = Math.min(30000, 2000 * Math.pow(2, this.reconnectAttempt));
-        this.reconnectAttempt++;
-        setTimeout(() => this.connect(), delay);
+        // Reconnect after 2 seconds
+        setTimeout(() => this.connect(), 2000);
       };
 
       this.ws.onerror = (err) => {
@@ -69,36 +62,20 @@ class SocketClient {
     const { type, payload } = msg;
 
     if (type === 'CLOCK_PONG') {
-      const clientReceiveTime = Date.now();
+      // performance.now() is specified as sub-millisecond and monotonic,
+      // where Date.now() is only guaranteed to millisecond resolution and
+      // has historically been quantized much more coarsely on some systems
+      // (Windows in particular, ~15.6ms ticks under default timer settings).
+      // performance.timeOrigin + performance.now() gives the same
+      // wall-clock-referenced value Date.now() would, at meaningfully finer
+      // precision — directly tightening the input to the RTT/offset math.
+      const clientReceiveTime = performance.timeOrigin + performance.now();
       const { clientSendTime, serverTime } = payload;
       const rttMs = clientReceiveTime - clientSendTime;
       // Cristian's algorithm: estimated server time when client receives = serverTime + (rtt / 2)
       // Clock Offset = (serverTime + rtt/2) - clientReceiveTime
       const estimatedServerTime = serverTime + rttMs / 2;
       const clockOffsetMs = estimatedServerTime - clientReceiveTime;
-
-      // Statistical Outlier Rejection using Interquartile Range (IQR)
-      // On the open internet, random routing hiccups can cause a ping to take
-      // 500ms when the average is 50ms. If we let that into the clock model,
-      // it skews the regression. We identify and drop these spikes entirely.
-      this.recentRtts.push(rttMs);
-      if (this.recentRtts.length > 20) {
-        this.recentRtts.shift();
-      }
-
-      if (this.recentRtts.length >= 10) {
-        const sorted = [...this.recentRtts].sort((a, b) => a - b);
-        const q1 = sorted[Math.floor(sorted.length * 0.25)];
-        const q3 = sorted[Math.floor(sorted.length * 0.75)];
-        const iqr = q3 - q1;
-        // Strict upper bound for latency spikes (1.5x IQR is standard)
-        const upperBound = q3 + 1.5 * iqr;
-        
-        if (rttMs > upperBound && rttMs > 100) {
-          // Reject this sample, it's a network lag spike
-          return;
-        }
-      }
 
       const sample: ClockSyncResult = {
         clientSendTime,
@@ -124,23 +101,24 @@ class SocketClient {
   private startClockSyncLoop(): void {
     if (this.pingIntervalId) clearInterval(this.pingIntervalId);
 
-    // Initial rapid burst of 20 pings for fast first-pass calibration —
-    // The Linear Regression model needs points to draw a line. A faster,
-    // larger initial burst warms up the PID controller much faster.
-    for (let i = 0; i < 20; i++) {
-      setTimeout(() => this.sendClockPing(), i * 100);
+    // Initial rapid burst of 10 pings for fast first-pass calibration —
+    // the very first pings after a fresh connection tend to be noisy
+    // (TLS handshake overhead, a cold server waking up), so more samples
+    // up front means outliers get outvoted quickly instead of lingering.
+    for (let i = 0; i < 10; i++) {
+      setTimeout(() => this.sendClockPing(), i * 200);
     }
 
-    // Fast warm-up cadence for the first ~15 seconds while the regression
-    // settles, then ease back to a lighter steady-state interval.
+    // Fast warm-up cadence for the first ~10 seconds while the offset is
+    // still settling, then ease back to a lighter steady-state interval.
     let warmupPings = 0;
     const warmupIntervalId = setInterval(() => {
       this.sendClockPing();
       warmupPings++;
-      if (warmupPings >= 20) {
+      if (warmupPings >= 12) {
         clearInterval(warmupIntervalId);
       }
-    }, 700);
+    }, 800);
 
     // Continuous NTP clock alignment every 2.5 seconds, ongoing
     this.pingIntervalId = setInterval(() => {
@@ -156,7 +134,6 @@ class SocketClient {
         this.send('LATENCY_REPORT', {
           rttMs: audioEngine.getSmoothedRTT(),
           clockOffsetMs: audioEngine.getSmoothedOffset(),
-          audioDriftMs: audioEngine.getLastMeasuredDriftMs(),
           isBuffering: audioEngine.getIsLoadingTrack()
         });
       }
@@ -171,7 +148,7 @@ class SocketClient {
   public sendClockPing(): void {
     if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.send('CLOCK_PING', {
-        clientSendTime: Date.now()
+        clientSendTime: performance.timeOrigin + performance.now()
       });
     }
   }
@@ -199,13 +176,6 @@ class SocketClient {
 
   public getMyClientId(): string | null {
     return this.myClientId;
-  }
-
-  public leaveRoom(): void {
-    if (this.roomCode) {
-      this.send('LEAVE_ROOM', { roomCode: this.roomCode });
-      this.roomCode = null;
-    }
   }
 
   public getRoomCode(): string | null {

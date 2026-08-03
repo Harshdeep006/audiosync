@@ -49,6 +49,11 @@ interface RoomServer {
     serverScheduledTimestamp: number;
     startPositionOffset: number;
     playbackRate: number;
+    // "Prepare" phase: a track everyone must confirm they've fully downloaded
+    // and decoded before we commit to a synchronized start time. Nobody
+    // starts playing anything on a guess about how long that should take.
+    pendingTrack: AudioTrackServer | null;
+    pendingStartPositionOffset: number;
   };
   queue: AudioTrackServer[];
   settings: {
@@ -57,6 +62,10 @@ interface RoomServer {
     bufferDurationMs: number;
     allowParticipantControl: boolean;
   };
+  // Server-only bookkeeping for the readiness barrier — never sent to clients
+  // directly; only a derived ready/total count is included in broadcasts.
+  pendingReadyClientIds: Set<string>;
+  pendingReadyTimeout: NodeJS.Timeout | null;
 }
 
 const DEFAULT_TRACKS: AudioTrackServer[] = [
@@ -104,18 +113,39 @@ const DEFAULT_TRACKS: AudioTrackServer[] = [
 
 const rooms = new Map<string, RoomServer>();
 const clients = new Map<string, ClientConnection>();
-const uploadedAudioFiles = new Map<string, { data: Buffer; contentType: string; uploadedAt: number }>();
+const uploadedAudioFiles = new Map<string, { data: Buffer; contentType: string }>();
 
-// Automatically evict uploaded files older than 2 hours to prevent memory leaks.
-const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000;
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, file] of uploadedAudioFiles) {
-    if (now - file.uploadedAt > UPLOAD_TTL_MS) {
-      uploadedAudioFiles.delete(id);
-    }
-  }
-}, 10 * 60 * 1000);
+// Date.now() only guarantees millisecond resolution, and on some systems
+// (older Windows timer defaults especially) can be quantized far coarser
+// than that in practice. process.hrtime is a high-resolution monotonic
+// clock but isn't wall-clock-anchored by itself, so we capture one Date.now()
+// reading alongside an hrtime reading once at startup, then use the
+// monotonic clock's fine-grained ticking relative to that anchor for every
+// subsequent "current wall time" read — giving sub-millisecond precision
+// server timestamps for the one thing that actually benefits from it: the
+// value each client's clock-offset calculation is measured against.
+const serverTimeAnchorDateMs = Date.now();
+const serverTimeAnchorHrtimeNs = process.hrtime.bigint();
+
+function getHighResServerTime(): number {
+  const elapsedNs = process.hrtime.bigint() - serverTimeAnchorHrtimeNs;
+  return serverTimeAnchorDateMs + Number(elapsedNs) / 1e6;
+}
+
+// Once every device has confirmed it's fully buffered, the only remaining
+// question is how much lead time the final "start now" message itself needs
+// to reliably arrive everywhere before the target instant. A fixed constant
+// either wastes time on a fast LAN or risks being too tight on a slow one —
+// sizing it from each room's actual currently-measured round trips lets a
+// hotspot/LAN session commit almost immediately while a slower internet
+// session still gets a safe margin, automatically, with no manual mode switch.
+function computeCommitLeadMs(room: RoomServer): number {
+  const observedRtts = Array.from(room.participants.values())
+    .map((p) => p.rttMs)
+    .filter((rtt) => rtt > 0);
+  const worstRtt = observedRtts.length > 0 ? Math.max(...observedRtts) : 150;
+  return Math.max(400, Math.min(3000, worstRtt + 300));
+}
 
 function getLocalNetworkAddresses(): string[] {
   const interfaces = os.networkInterfaces();
@@ -184,7 +214,7 @@ async function startServer() {
 
     const id = 'upload_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const contentType = req.headers['content-type']?.toString() || 'audio/mpeg';
-    uploadedAudioFiles.set(id, { data: req.body, contentType, uploadedAt: Date.now() });
+    uploadedAudioFiles.set(id, { data: req.body, contentType });
 
     res.json({ id, url: `/api/uploads/${id}` });
   });
@@ -310,7 +340,11 @@ async function startServer() {
       participants: participantsById,
       playback: room.playback,
       queue: room.queue,
-      settings: room.settings
+      settings: room.settings,
+      readiness: {
+        readyCount: room.pendingReadyClientIds.size,
+        totalCount: room.participants.size
+      }
     };
 
     const messageStr = JSON.stringify({
@@ -349,7 +383,7 @@ async function startServer() {
             type: 'CLOCK_PONG',
             payload: {
               clientSendTime: payload.clientSendTime,
-              serverTime: Date.now()
+              serverTime: getHighResServerTime()
             },
             timestamp: Date.now()
           }));
@@ -380,15 +414,19 @@ async function startServer() {
               position: 0,
               serverScheduledTimestamp: 0,
               startPositionOffset: 0,
-              playbackRate: 1.0
+              playbackRate: 1.0,
+              pendingTrack: null,
+              pendingStartPositionOffset: 0
             },
             queue: [...DEFAULT_TRACKS],
             settings: {
               autoSyncEnabled: true,
-              maxAllowedDriftMs: 50,
-              bufferDurationMs: 800,
+              maxAllowedDriftMs: 15,
+              bufferDurationMs: 4500,
               allowParticipantControl: false
-            }
+            },
+            pendingReadyClientIds: new Set(),
+            pendingReadyTimeout: null
           };
 
           newRoom.participants.set(clientId, {
@@ -484,22 +522,55 @@ async function startServer() {
           }
 
           const { action, track, position, playbackRate } = payload;
-          const currentServerTime = Date.now();
+          const currentServerTime = getHighResServerTime();
 
-          // Adaptive buffer: scale from actual network conditions instead of a
-          // fixed constant.  Use 3× the worst participant RTT + 200 ms headroom
-          // so every device has time to receive the message and schedule audio,
-          // but clamp to [300, 3000] ms to stay sane on both LAN and WAN.
-          let maxRtt = 0;
-          room.participants.forEach(p => { if (p.rttMs > maxRtt) maxRtt = p.rttMs; });
-          const adaptiveBuffer = Math.max(300, Math.min(3000, maxRtt * 3 + 200));
-          const bufferDelayMs = Math.max(adaptiveBuffer, room.settings.bufferDurationMs || 800);
+          // Commits a prepared track to an actual synchronized start time —
+          // called once every device has confirmed it's fully buffered, or
+          // the safety timeout fires and we proceed without stragglers.
+          const commitPendingPlayback = (rc: string) => {
+            const r = rooms.get(rc);
+            if (!r || !r.playback.pendingTrack) return;
+            if (r.pendingReadyTimeout) {
+              clearTimeout(r.pendingReadyTimeout);
+              r.pendingReadyTimeout = null;
+            }
+            r.playback.track = r.playback.pendingTrack;
+            r.playback.startPositionOffset = r.playback.pendingStartPositionOffset;
+            r.playback.position = r.playback.pendingStartPositionOffset;
+            r.playback.isPlaying = true;
+            // Everyone confirmed ready (or we gave up waiting), so the only
+            // remaining lead time needed is for this message itself to
+            // arrive — sized to actual measured conditions in this room,
+            // not a one-size-fits-all guess.
+            r.playback.serverScheduledTimestamp = getHighResServerTime() + computeCommitLeadMs(r);
+            r.playback.pendingTrack = null;
+            r.pendingReadyClientIds.clear();
+            broadcastRoomState(rc);
+          };
+
+          // Starts the prepare phase: broadcasts the pending track so every
+          // client begins downloading/decoding it, and waits for everyone to
+          // report PLAYBACK_READY before actually scheduling a start time.
+          const beginPreparePhase = (newTrack: any, startPosSec: number) => {
+            if (room.pendingReadyTimeout) {
+              clearTimeout(room.pendingReadyTimeout);
+            }
+            room.playback.pendingTrack = newTrack;
+            room.playback.pendingStartPositionOffset = startPosSec;
+            room.playback.isPlaying = false;
+            room.playback.serverScheduledTimestamp = 0;
+            room.pendingReadyClientIds.clear();
+
+            room.pendingReadyTimeout = setTimeout(() => {
+              commitPendingPlayback(roomCode);
+            }, 12000); // safety net — don't let one stuck device hold up the room forever
+
+            broadcastRoomState(roomCode);
+          };
 
           if (action === 'PLAY') {
-            room.playback.isPlaying = true;
-            room.playback.startPositionOffset = position !== undefined ? position : room.playback.position;
-            room.playback.serverScheduledTimestamp = currentServerTime + bufferDelayMs;
-            room.playback.position = room.playback.startPositionOffset;
+            const startPos = position !== undefined ? position : room.playback.position;
+            beginPreparePhase(room.playback.track, startPos);
           } else if (action === 'PAUSE') {
             // Calculate elapsed audio position before pausing
             if (room.playback.isPlaying && room.playback.serverScheduledTimestamp > 0) {
@@ -508,25 +579,60 @@ async function startServer() {
             }
             room.playback.isPlaying = false;
             room.playback.serverScheduledTimestamp = 0;
+            if (room.pendingReadyTimeout) {
+              clearTimeout(room.pendingReadyTimeout);
+              room.pendingReadyTimeout = null;
+            }
+            room.playback.pendingTrack = null;
+            room.pendingReadyClientIds.clear();
           } else if (action === 'SEEK') {
+            // Track is already loaded on every device by this point (it's
+            // already playing) — no re-download needed, so this only needs
+            // the same short adaptive lead time as any other commit, not
+            // the full track-buffering allowance.
             const seekPos = position || 0;
             room.playback.startPositionOffset = seekPos;
             room.playback.position = seekPos;
             if (room.playback.isPlaying) {
-              room.playback.serverScheduledTimestamp = currentServerTime + bufferDelayMs;
+              room.playback.serverScheduledTimestamp = getHighResServerTime() + computeCommitLeadMs(room);
             }
           } else if (action === 'CHANGE_TRACK') {
             if (track) {
-              room.playback.track = track;
-              room.playback.startPositionOffset = 0;
-              room.playback.position = 0;
-              room.playback.isPlaying = true;
-              room.playback.serverScheduledTimestamp = currentServerTime + bufferDelayMs;
+              beginPreparePhase(track, 0);
             }
           }
 
           if (playbackRate !== undefined) {
             room.playback.playbackRate = playbackRate;
+          }
+
+          broadcastRoomState(roomCode);
+          return;
+        }
+
+        // 4b. A client confirms it has fully downloaded and decoded the
+        // pending track and is ready for the synchronized start to be
+        // scheduled.
+        if (type === 'PLAYBACK_READY') {
+          const roomCode = connection.roomCode;
+          if (!roomCode) return;
+          const room = rooms.get(roomCode);
+          if (!room || !room.playback.pendingTrack) return;
+
+          room.pendingReadyClientIds.add(clientId);
+
+          if (room.pendingReadyClientIds.size >= room.participants.size) {
+            if (room.pendingReadyTimeout) {
+              clearTimeout(room.pendingReadyTimeout);
+              room.pendingReadyTimeout = null;
+            }
+            room.playback.track = room.playback.pendingTrack;
+            room.playback.startPositionOffset = room.playback.pendingStartPositionOffset;
+            room.playback.position = room.playback.pendingStartPositionOffset;
+            room.playback.isPlaying = true;
+            room.playback.serverScheduledTimestamp = getHighResServerTime() + computeCommitLeadMs(room);
+            room.playback.pendingTrack = null;
+            room.pendingReadyClientIds.clear();
           }
 
           broadcastRoomState(roomCode);
@@ -563,12 +669,7 @@ async function startServer() {
           if (p) {
             p.rttMs = payload.rttMs || 0;
             p.clockOffsetMs = payload.clockOffsetMs || 0;
-            // Use the actual measured audio drift (how far buffer position is
-            // from expected) rather than raw NTP clock offset for the sync
-            // indicator.  Clock offset on WiFi is naturally large (50-100ms)
-            // even when audio is perfectly in sync.
-            const drift = payload.audioDriftMs !== undefined ? payload.audioDriftMs : p.clockOffsetMs;
-            p.isSynced = Math.abs(drift) <= room.settings.maxAllowedDriftMs;
+            p.isSynced = Math.abs(p.clockOffsetMs) <= room.settings.maxAllowedDriftMs;
             p.isBuffering = payload.isBuffering || false;
             broadcastRoomState(roomCode);
           }
@@ -589,33 +690,6 @@ async function startServer() {
           return;
         }
 
-        // 8. Leave Room (graceful exit without closing WebSocket)
-        if (type === 'LEAVE_ROOM') {
-          const roomCode = connection.roomCode;
-          if (!roomCode) return;
-          connection.roomCode = null;
-
-          const room = rooms.get(roomCode);
-          if (room) {
-            room.participants.delete(clientId);
-            if (room.participants.size === 0) {
-              rooms.delete(roomCode);
-            } else {
-              if (room.hostId === clientId) {
-                const nextHost = Array.from(room.participants.values())[0];
-                if (nextHost) {
-                  room.hostId = nextHost.id;
-                  nextHost.role = 'host';
-                  const nextClient = clients.get(nextHost.id);
-                  if (nextClient) nextClient.role = 'host';
-                }
-              }
-              broadcastRoomState(roomCode);
-            }
-          }
-          return;
-        }
-
       } catch (err) {
         console.error('Failed to parse WebSocket message:', err);
       }
@@ -629,7 +703,9 @@ async function startServer() {
         const room = rooms.get(roomCode);
         if (room) {
           room.participants.delete(clientId);
+          room.pendingReadyClientIds.delete(clientId);
           if (room.participants.size === 0) {
+            if (room.pendingReadyTimeout) clearTimeout(room.pendingReadyTimeout);
             rooms.delete(roomCode);
           } else {
             // If host left, assign new host
@@ -641,6 +717,21 @@ async function startServer() {
                 const nextClient = clients.get(nextHost.id);
                 if (nextClient) nextClient.role = 'host';
               }
+            }
+            // If everyone remaining is now ready (the person we were still
+            // waiting on just left), don't leave the room stuck waiting.
+            if (room.playback.pendingTrack && room.pendingReadyClientIds.size >= room.participants.size) {
+              if (room.pendingReadyTimeout) {
+                clearTimeout(room.pendingReadyTimeout);
+                room.pendingReadyTimeout = null;
+              }
+              room.playback.track = room.playback.pendingTrack;
+              room.playback.startPositionOffset = room.playback.pendingStartPositionOffset;
+              room.playback.position = room.playback.pendingStartPositionOffset;
+              room.playback.isPlaying = true;
+              room.playback.serverScheduledTimestamp = getHighResServerTime() + computeCommitLeadMs(room);
+              room.playback.pendingTrack = null;
+              room.pendingReadyClientIds.clear();
             }
             broadcastRoomState(roomCode);
           }

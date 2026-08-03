@@ -58,7 +58,7 @@ export const AudioSpectrumCanvas: React.FC<AudioSpectrumCanvasProps> = ({
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [isPlaying, isDarkMode]);
+  }, [isPlaying]);
 
   return (
     <canvas

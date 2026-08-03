@@ -6,6 +6,7 @@ import { JoinRoomModal } from './components/JoinRoomModal';
 import { RoomView } from './components/RoomView';
 import { QRCodeModal } from './components/QRCodeModal';
 import { ArchitectureModal } from './components/ArchitectureModal';
+import { HotspotWizardModal } from './components/HotspotWizardModal';
 import { socketClient } from './lib/socketClient';
 import { audioEngine } from './lib/audioEngine';
 import { Room, AudioChannelRole, WSMessage } from './types';
@@ -20,6 +21,7 @@ export default function App() {
   const [joinInitialCode, setJoinInitialCode] = useState<string>('');
   const [isQRModalOpen, setIsQRModalOpen] = useState<boolean>(false);
   const [isArchitectureModalOpen, setIsArchitectureModalOpen] = useState<boolean>(false);
+  const [isHotspotWizardOpen, setIsHotspotWizardOpen] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
@@ -97,10 +99,7 @@ export default function App() {
   };
 
   const handleLeaveRoom = () => {
-    audioEngine.stopPlayback();
-    socketClient.leaveRoom();
     setCurrentRoom(null);
-    setMyClientId('');
     window.history.pushState({}, '', window.location.pathname);
   };
 
@@ -139,6 +138,7 @@ export default function App() {
           onCreateRoom={() => setIsCreateModalOpen(true)}
           onJoinRoom={handleOpenJoinWithCode}
           onQuickDemo={handleQuickDemo}
+          onOpenHotspotWizard={() => setIsHotspotWizardOpen(true)}
           isDarkMode={isDarkMode}
         />
       )}
@@ -163,12 +163,18 @@ export default function App() {
         isOpen={isQRModalOpen}
         onClose={() => setIsQRModalOpen(false)}
         roomCode={currentRoom?.code || ''}
-        isDarkMode={isDarkMode}
       />
 
       <ArchitectureModal
         isOpen={isArchitectureModalOpen}
         onClose={() => setIsArchitectureModalOpen(false)}
+        isDarkMode={isDarkMode}
+      />
+
+      <HotspotWizardModal
+        isOpen={isHotspotWizardOpen}
+        onClose={() => setIsHotspotWizardOpen(false)}
+        onReadyToCreateRoom={() => setIsCreateModalOpen(true)}
         isDarkMode={isDarkMode}
       />
 

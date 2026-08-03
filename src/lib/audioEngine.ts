@@ -1,89 +1,5 @@
 import { AudioChannelRole, ClockSyncResult, PerformanceMetrics } from '../types';
 
-// Linear Regression Clock Model:
-// Standard simple averages (EMA) for clock offset suffer over the internet because
-// they constantly lag behind real hardware clock drift and fluctuate with jitter.
-// By plotting the best (lowest RTT) local vs. server timestamps and drawing a line 
-// through them, we discover both the exact offset and the hardware clock skew 
-// (slope). This perfectly predicts server time even between pings.
-class LinearRegressionClock {
-  private history: { local: number; server: number; rtt: number }[] = [];
-  private maxHistory = 60;
-  private slope = 1;
-  private intercept = 0;
-  private minRtt = Infinity;
-
-  public addSample(localTime: number, serverTime: number, rtt: number) {
-    this.history.push({ local: localTime, server: serverTime, rtt });
-    if (this.history.length > this.maxHistory) {
-      this.history.shift();
-    }
-    this.minRtt = Math.min(...this.history.map(p => p.rtt));
-    this.calculate();
-  }
-
-  private calculate() {
-    // Filter to only the best RTTs (Cristian's algorithm min-filter logic)
-    // Over the internet, high RTT means asymmetric delay. We ONLY want points close to minRtt.
-    const bestSamples = this.history.filter(p => p.rtt <= this.minRtt * 1.2 || p.rtt <= this.minRtt + 20);
-    
-    let samples = bestSamples;
-    if (samples.length < 2 && this.history.length >= 2) {
-      // Fallback: take best 5 points if we don't have enough strictly near minRtt
-      const sorted = [...this.history].sort((a, b) => a.rtt - b.rtt);
-      samples = sorted.slice(0, 5);
-    }
-
-    if (samples.length < 2) {
-       if (samples.length === 1) {
-           this.slope = 1;
-           this.intercept = samples[0].server - samples[0].local;
-       }
-       return;
-    }
-
-    // Center the data to prevent float precision loss when squaring large JS timestamps (1.7e12)
-    const xOffset = samples[0].local;
-    
-    let sumX = 0, sumY = 0;
-    samples.forEach(p => {
-      sumX += (p.local - xOffset);
-      sumY += (p.server - xOffset); 
-    });
-    const xMean = sumX / samples.length;
-    const yMean = sumY / samples.length;
-
-    let num = 0, den = 0;
-    samples.forEach(p => {
-      const xDiff = (p.local - xOffset) - xMean;
-      num += xDiff * ((p.server - xOffset) - yMean);
-      den += xDiff * xDiff;
-    });
-
-    if (den === 0) {
-      this.slope = 1;
-      this.intercept = (yMean + xOffset) - (xMean + xOffset);
-    } else {
-      this.slope = num / den;
-      this.intercept = (yMean + xOffset) - this.slope * (xMean + xOffset);
-    }
-  }
-
-  public predictServerTime(localTimeMs: number): number {
-    return this.slope * localTimeMs + this.intercept;
-  }
-
-  public getSmoothedOffset(): number {
-    const now = Date.now();
-    return this.predictServerTime(now) - now;
-  }
-
-  public getSmoothedRTT(): number {
-    return this.minRtt === Infinity ? 0 : this.minRtt;
-  }
-}
-
-
 class AudioEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
@@ -98,7 +14,10 @@ class AudioEngine {
   private currentPlaybackId: number = 0;
 
   // Clock Sync Metrics (NTP / Cristian's Algorithm)
-  private clockModel = new LinearRegressionClock();
+  private clockOffsets: number[] = [];
+  private rttHistory: number[] = [];
+  private smoothedClockOffset: number = 0;
+  private smoothedRTT: number = 0;
 
   private currentChannelRole: AudioChannelRole = 'full';
   private scheduledAudioContextStartTime: number = 0;
@@ -114,26 +33,6 @@ class AudioEngine {
   private frozenOffsetAtScheduleMs: number = 0;
   private lastMeasuredDriftMs: number = 0;
   private clockSampleCount: number = 0;
-
-  // Rate-aware position tracking: because the drift correction loop changes the
-  // playback rate, we can't just use (ctx.currentTime - startTime) to know where
-  // the buffer actually is.  Instead we maintain a running accumulator that gets
-  // snapshotted every time the rate changes.
-  private lastKnownBufferPos: number = 0;
-  private lastPosTrackCtxTime: number = 0;
-  private currentEffectiveRate: number = 1.0;
-
-  // Smoothed drift reading: over the internet, NTP offset estimates jitter
-  // by ±10-20ms between readings. Using each raw drift measurement directly
-  // causes the correction to oscillate — the EMA filters that noise out.
-  private smoothedDriftMs: number = 0;
-  
-  // PID Controller state for advanced drift correction
-  private pidIntegral: number = 0;
-  private pidLastDrift: number = 0;
-
-  // Manual calibration to fix asymmetric internet routing (where ping up != ping down)
-  private manualSyncOffsetMs: number = 0;
 
   constructor() {
     // Lazy initialization on user interaction
@@ -179,29 +78,54 @@ class AudioEngine {
     const { rttMs, clockOffsetMs } = sample;
     this.clockSampleCount++;
 
-    const localTime = Date.now();
-    const serverTime = localTime + clockOffsetMs;
-    this.clockModel.addSample(localTime, serverTime, rttMs);
+    this.rttHistory.push(rttMs);
+    this.clockOffsets.push(clockOffsetMs);
+    // A wider window resists a jittery connection (occasional RTT spikes)
+    // dominating the average; the burst/warm-up pings still get us enough
+    // samples fast, this just stops one bad reading from swinging things.
+    if (this.rttHistory.length > 30) {
+      this.rttHistory.shift();
+      this.clockOffsets.shift();
+    }
+
+    // Under Cristian's algorithm, a faster round trip means less uncertainty
+    // in the "network delay was symmetric" assumption. Real-world WiFi/mobile
+    // paths often have a fairly steady total RTT while the up/down split
+    // varies a lot between individual pings — a fixed top-N% cut can still
+    // include samples whose asymmetry just happened not to be the worst in
+    // the batch. Trusting only samples close to the single best round trip
+    // actually observed is the standard NTP min-filter approach and is more
+    // resistant to that specific noise pattern.
+    const paired = this.rttHistory.map((rtt, i) => ({ rtt, offset: this.clockOffsets[i] }));
+    const minRtt = Math.min(...this.rttHistory);
+    let bestSamples = paired.filter((s) => s.rtt <= minRtt * 1.15);
+    if (bestSamples.length < 3) {
+      // Not enough close-to-best samples yet — fall back to the closest 3.
+      paired.sort((a, b) => a.rtt - b.rtt);
+      bestSamples = paired.slice(0, 3);
+    }
+
+    if (bestSamples.length > 0) {
+      const sum = bestSamples.reduce((acc, s) => acc + s.offset, 0);
+      this.smoothedClockOffset = sum / bestSamples.length;
+      this.smoothedRTT = minRtt;
+    } else {
+      this.smoothedClockOffset = clockOffsetMs;
+      this.smoothedRTT = rttMs;
+    }
   }
 
   public getEstimatedServerTime(): number {
-    return this.clockModel.predictServerTime(Date.now()) + this.manualSyncOffsetMs;
+    // Client local time + offset = Server time
+    return (performance.timeOrigin + performance.now()) + this.smoothedClockOffset;
   }
 
   public getSmoothedOffset(): number {
-    return this.clockModel.getSmoothedOffset() + this.manualSyncOffsetMs;
+    return this.smoothedClockOffset;
   }
 
   public getSmoothedRTT(): number {
-    return this.clockModel.getSmoothedRTT();
-  }
-
-  public setManualSyncOffset(offsetMs: number): void {
-    this.manualSyncOffsetMs = offsetMs;
-  }
-
-  public getManualSyncOffset(): number {
-    return this.manualSyncOffsetMs;
+    return this.smoothedRTT;
   }
 
   // Role-Based Audio Frequency & Panning Separation
@@ -254,22 +178,6 @@ class AudioEngine {
   public setVolume(volume: number): void {
     if (this.masterGain && this.ctx) {
       this.masterGain.gain.setValueAtTime(Math.max(0, Math.min(1, volume)), this.ctx.currentTime);
-    }
-  }
-
-  // Snapshot the current buffer position, then apply the new rate.
-  // Using setValueAtTime (instant) instead of setTargetAtTime (exponential curve)
-  // so the position accumulator stays accurate — the tiny rate deltas (0.3–8%)
-  // are small enough to be inaudible as an instantaneous change.
-  private applyPlaybackRate(rate: number): void {
-    if (!this.ctx) return;
-    const now = this.ctx.currentTime;
-    const elapsed = Math.max(0, now - this.lastPosTrackCtxTime);
-    this.lastKnownBufferPos += elapsed * this.currentEffectiveRate;
-    this.lastPosTrackCtxTime = now;
-    this.currentEffectiveRate = rate;
-    if (this.currentSource) {
-      this.currentSource.playbackRate.setValueAtTime(rate, now);
     }
   }
 
@@ -383,8 +291,7 @@ class AudioEngine {
     // genuinely wanders with real network jitter — re-deriving "expected
     // position" from whatever it currently reads would mean chasing a moving
     // target instead of correcting for real hardware clock-rate drift.
-    // NOTE: With Linear Regression, we don't strictly need freezing as much,
-    // but we still want to evaluate drift relative to a stable timeline.
+    this.frozenOffsetAtScheduleMs = this.smoothedClockOffset;
 
     if (secUntilStart > 0) {
       // Future scheduling: Start audio at exact context time in future
@@ -392,10 +299,6 @@ class AudioEngine {
       source.start(targetCtxTime, Math.max(0, startPositionOffsetSec));
       this.scheduledAudioContextStartTime = targetCtxTime;
       this.scheduledAudioOffsetSec = startPositionOffsetSec;
-      // Initialize rate-aware position tracking
-      this.lastKnownBufferPos = startPositionOffsetSec;
-      this.lastPosTrackCtxTime = targetCtxTime;
-      this.currentEffectiveRate = playbackRate;
     } else {
       // Late join / catch-up: Calculate current offset position in track
       const elapsedTrackSec = Math.abs(secUntilStart) * playbackRate;
@@ -405,10 +308,6 @@ class AudioEngine {
         source.start(ctx.currentTime, currentTrackPositionSec);
         this.scheduledAudioContextStartTime = ctx.currentTime;
         this.scheduledAudioOffsetSec = currentTrackPositionSec;
-        // Initialize rate-aware position tracking
-        this.lastKnownBufferPos = currentTrackPositionSec;
-        this.lastPosTrackCtxTime = ctx.currentTime;
-        this.currentEffectiveRate = playbackRate;
       }
     }
 
@@ -442,76 +341,41 @@ class AudioEngine {
       const sinceActualStartSec = this.ctx.currentTime - this.scheduledAudioContextStartTime;
       if (sinceActualStartSec < 1.0) return;
 
-      // Use the LIVE modeled clock offset via Linear Regression
-      const estServerTime = this.getEstimatedServerTime();
+      // Use the offset frozen at schedule time, not the live estimate — the
+      // live one keeps getting re-measured and genuinely wanders with real
+      // network jitter, which would otherwise make this comparison chase a
+      // moving target instead of tracking real elapsed time.
+      const estServerTime = (performance.timeOrigin + performance.now()) + this.frozenOffsetAtScheduleMs;
       const elapsedServerSec = Math.max(0, (estServerTime - this.activeServerScheduledTimestampMs) / 1000);
       const expectedPositionSec = this.activeStartPositionOffsetSec + elapsedServerSec * this.activeBasePlaybackRate;
-      
-      const bufferPositionSec = this.getCurrentTrackPosition();
-      // HUGE FIX: The buffer position is NOT the speaker position! It takes outputLatency
-      // seconds for the audio graph to reach the physical speaker hardware. 
-      // If we don't subtract this, the drift loop will actively *force* the audio to be 
-      // out of sync by exactly the device's hardware latency!
-      const outputLatencySec = (this.ctx as any).outputLatency ?? this.ctx.baseLatency ?? 0;
-      const speakerPositionSec = bufferPositionSec - outputLatencySec;
-      
-      const rawDriftMs = (expectedPositionSec - speakerPositionSec) * 1000;
+      const actualPositionSec = this.getCurrentTrackPosition();
+      const driftMs = (expectedPositionSec - actualPositionSec) * 1000;
+      this.lastMeasuredDriftMs = driftMs;
 
-      // Large jump — bypass smoothing and hard-resync immediately.
-      if (Math.abs(rawDriftMs) > 80) {
-        this.smoothedDriftMs = 0;
-        this.pidIntegral = 0;
-        this.pidLastDrift = 0;
-        this.lastMeasuredDriftMs = rawDriftMs;
+      if (Math.abs(driftMs) > 200) {
+        // Large drift — likely a throttled/backgrounded tab or a network stall.
+        // A gentle rate nudge would take too long to catch up audibly; jump instead.
         this.hardResync(expectedPositionSec);
         return;
       }
 
-      // Exponential moving average: 60% previous + 40% new. At 500ms intervals
-      // this gives a ~1.5s time constant — fast enough to track real drift,
-      // smooth enough to filter the ±10-20ms jitter typical of internet links.
-      this.smoothedDriftMs = this.smoothedDriftMs * 0.6 + rawDriftMs * 0.4;
-      this.lastMeasuredDriftMs = this.smoothedDriftMs;
-
-      if (Math.abs(this.smoothedDriftMs) < 3) {
-        // Within extremely tight tolerance — return to nominal speed and reset integral.
-        if (this.currentEffectiveRate !== this.activeBasePlaybackRate) {
-          this.applyPlaybackRate(this.activeBasePlaybackRate);
-        }
-        // Decay integral slowly when in deadzone so we don't hold onto old error
-        this.pidIntegral *= 0.8;
+      if (Math.abs(driftMs) < 6) {
+        // Within tolerance — ease back to nominal speed.
+        this.currentSource.playbackRate.setTargetAtTime(this.activeBasePlaybackRate, this.ctx.currentTime, 0.5);
         return;
       }
 
-      // PID Controller (Proportional-Integral-Derivative)
-      // Standard proportional correction oscillates over the internet because of jitter.
-      // A PID controller dampens the oscillation (Derivative) and slowly eliminates
-      // steady-state error (Integral), locking into sub-millisecond sync.
-      
-      const dt = 0.5; // Loop runs every 500ms
-      const error = this.smoothedDriftMs;
-      
-      this.pidIntegral += error * dt;
-      // Anti-windup: cap the integral term so it doesn't build up too much during lags
-      this.pidIntegral = Math.max(-500, Math.min(500, this.pidIntegral));
-      
-      const derivative = (error - this.pidLastDrift) / dt;
-      this.pidLastDrift = error;
-
-      // Tuning parameters - Aggressive enough to close a 100ms gap in ~2 seconds,
-      // but dampened enough to prevent 'wobble'.
-      const Kp = 0.0005;   // Proportional: 0.05 (5% speedup) at 100ms error
-      const Ki = 0.00005;  // Integral: Closes persistent hardware clock skews
-      const Kd = 0.00015;  // Derivative: Brakes hard when approaching 0 to stop oscillation
-
-      const adjustment = (Kp * error) + (Ki * this.pidIntegral) + (Kd * derivative);
-      
-      // Clamp adjustment to max ±8% (0.08) to keep it strictly inaudible
-      const clampedAdjustment = Math.max(-0.08, Math.min(0.08, adjustment));
-      
-      const corrected = this.activeBasePlaybackRate * (1 + clampedAdjustment);
-      this.applyPlaybackRate(corrected);
-    }, 500);
+      // Proportional correction: bigger drift gets a firmer nudge instead of the
+      // same flat ~2% regardless of size. This is what closes small, slowly
+      // accumulating gaps (real hardware clocks never run at exactly the same
+      // speed on two devices) instead of perpetually chasing a moving target.
+      // Scaled and clamped to stay inaudible: 6ms -> ~0.3%, 100ms -> ~5%, 200ms cap ~8%.
+      const proportionalAdjustment = Math.min(0.08, Math.abs(driftMs) / 2500);
+      const corrected = driftMs > 0
+        ? this.activeBasePlaybackRate * (1 + proportionalAdjustment)
+        : this.activeBasePlaybackRate * (1 - proportionalAdjustment);
+      this.currentSource.playbackRate.setTargetAtTime(corrected, this.ctx.currentTime, 0.3);
+    }, 700);
   }
 
   private hardResync(targetPositionSec: number): void {
@@ -524,27 +388,12 @@ class AudioEngine {
 
     const source = this.ctx.createBufferSource();
     source.buffer = buffer;
-    source.playbackRate.value = this.activeBasePlaybackRate;
+    source.playbackRate.value = rate;
     source.connect(this.channelFilter!);
+    source.start(this.ctx.currentTime, targetPositionSec);
 
-    // When we start "now", it takes outputLatencySec for the sound to hit the speaker.
-    // By the time it hits the speaker, the expected position will have advanced.
-    const outputLatencySec = (this.ctx as any).outputLatency ?? this.ctx.baseLatency ?? 0;
-    const targetSpeakerPositionSec = targetPositionSec + (outputLatencySec * this.activeBasePlaybackRate);
-
-    source.start(this.ctx.currentTime, targetSpeakerPositionSec);
     this.scheduledAudioContextStartTime = this.ctx.currentTime;
-    this.scheduledAudioOffsetSec = targetSpeakerPositionSec;
-    // Reset position tracking to the resynced position
-    this.lastKnownBufferPos = targetSpeakerPositionSec;
-    this.lastPosTrackCtxTime = this.ctx.currentTime;
-    this.currentEffectiveRate = rate;
-    
-    // Reset PID state
-    this.pidIntegral = 0;
-    this.pidLastDrift = 0;
-    this.smoothedDriftMs = 0;
-    
+    this.scheduledAudioOffsetSec = targetPositionSec;
     this.currentSource = source;
 
     source.onended = () => {
@@ -563,11 +412,8 @@ class AudioEngine {
 
   public getCurrentTrackPosition(): number {
     if (!this.ctx || !this.currentSource) return 0;
-    // Use the rate-aware accumulator: lastKnownBufferPos is snapshotted every
-    // time the playback rate changes, so the elapsed-since-snapshot segment is
-    // always at a single known rate.
-    const elapsed = Math.max(0, this.ctx.currentTime - this.lastPosTrackCtxTime);
-    return this.lastKnownBufferPos + elapsed * this.currentEffectiveRate;
+    const elapsedSinceStart = Math.max(0, this.ctx.currentTime - this.scheduledAudioContextStartTime);
+    return this.scheduledAudioOffsetSec + elapsedSinceStart;
   }
 
   public getFrequencyData(): Uint8Array {
@@ -579,9 +425,9 @@ class AudioEngine {
 
   public getPerformanceMetrics(): PerformanceMetrics {
     return {
-      ping: this.getSmoothedRTT(),
-      jitter: 0, // Internet spikes are now dropped by the IQR filter entirely
-      offset: this.getSmoothedOffset(),
+      ping: this.smoothedRTT,
+      jitter: Math.abs(this.smoothedRTT - (this.rttHistory[this.rttHistory.length - 1] || 0)),
+      offset: this.smoothedClockOffset,
       driftRate: 0.12,
       packetLoss: 0,
       bufferHealthPct: this.isLoadingTrack ? 40 : 100,

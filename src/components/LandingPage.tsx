@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Radio, QrCode, Sliders, Cpu, ArrowRight, Play, Pause, ShieldCheck, Wifi } from 'lucide-react';
+import { Radio, QrCode, Sliders, Cpu, ArrowRight, Play, Pause, ShieldCheck, Wifi, Zap } from 'lucide-react';
 import { audioEngine } from '../lib/audioEngine';
 import { AudioChannelRole } from '../types';
 
@@ -7,6 +7,7 @@ interface LandingPageProps {
   onCreateRoom: () => void;
   onJoinRoom: (code?: string) => void;
   onQuickDemo: () => void;
+  onOpenHotspotWizard: () => void;
   isDarkMode: boolean;
 }
 
@@ -23,6 +24,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   onCreateRoom,
   onJoinRoom,
   onQuickDemo,
+  onOpenHotspotWizard,
   isDarkMode
 }) => {
   const [joinInputCode, setJoinInputCode] = useState<string>('');
@@ -176,14 +178,27 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
           </div>
 
-          <button
-            onClick={onQuickDemo}
-            className={`mt-6 text-xs font-medium underline underline-offset-4 transition ${
-              isDarkMode ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-500 hover:text-zinc-700'
-            }`}
-          >
-            Try an instant demo room
-          </button>
+          <div className="mt-6 flex items-center justify-center gap-4 flex-wrap">
+            <button
+              onClick={onQuickDemo}
+              className={`text-xs font-medium underline underline-offset-4 transition ${
+                isDarkMode ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-500 hover:text-zinc-700'
+              }`}
+            >
+              Try an instant demo room
+            </button>
+
+            <span className={`text-xs ${isDarkMode ? 'text-zinc-700' : 'text-zinc-300'}`}>•</span>
+
+            <button
+              onClick={onOpenHotspotWizard}
+              className={`flex items-center gap-1.5 text-xs font-medium underline underline-offset-4 transition ${
+                isDarkMode ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-500 hover:text-zinc-700'
+              }`}
+            >
+              <Zap size={12} /> Set up best-sync (hotspot) mode
+            </button>
+          </div>
         </div>
       </section>
 

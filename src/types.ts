@@ -43,6 +43,8 @@ export interface PlaybackState {
   serverScheduledTimestamp: number; // UTC timestamp (ms) on server when playback starts
   startPositionOffset: number; // position in track when playback started
   playbackRate: number;
+  pendingTrack: AudioTrack | null; // track everyone must confirm buffered before it's scheduled
+  pendingStartPositionOffset: number;
 }
 
 export interface Room {
@@ -58,6 +60,10 @@ export interface Room {
     maxAllowedDriftMs: number;
     bufferDurationMs: number;
     allowParticipantControl: boolean;
+  };
+  readiness: {
+    readyCount: number;
+    totalCount: number;
   };
 }
 
@@ -77,10 +83,10 @@ export type WSMessageType =
   | 'ROOM_JOINED'
   | 'ROOM_STATE_UPDATE'
   | 'PLAYBACK_COMMAND'
+  | 'PLAYBACK_READY'
   | 'ROLE_UPDATE'
   | 'LATENCY_REPORT'
   | 'QUEUE_UPDATE'
-  | 'LEAVE_ROOM'
   | 'USER_LEFT'
   | 'ERROR'
   | 'CALIBRATE_REQUEST';

@@ -30,7 +30,6 @@ export const RoomView: React.FC<RoomViewProps> = ({
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [trackPositionSec, setTrackPositionSec] = useState<number>(0);
   const [startingInMs, setStartingInMs] = useState<number>(0);
-  const [manualOffsetMs, setManualOffsetMs] = useState<number>(audioEngine.getManualSyncOffset());
 
   const me = room.participants[myClientId];
   const isHost = room.hostId === myClientId;
@@ -76,13 +75,26 @@ export const RoomView: React.FC<RoomViewProps> = ({
     });
   }, [room.queue]);
 
-  // Eagerly preload the *current* track whenever it changes — covers
-  // late-joining devices and custom uploads that weren't in the original queue.
+  // Prepare phase: when the server proposes a track everyone must confirm
+  // before it commits to a synchronized start time, download+decode it here
+  // (usually already cached from the queue preload above) and report ready
+  // the moment it's genuinely usable — not a fixed guess.
+  const pendingTrack = room.playback.pendingTrack;
   useEffect(() => {
-    if (currentTrack) {
-      audioEngine.loadAudioBuffer(currentTrack.audioUrl, currentTrack.id).catch(() => {});
-    }
-  }, [currentTrack?.id, currentTrack?.audioUrl]);
+    if (!pendingTrack) return;
+    let cancelled = false;
+    audioEngine.loadAudioBuffer(pendingTrack.audioUrl, pendingTrack.id)
+      .then(() => {
+        if (!cancelled) {
+          socketClient.send('PLAYBACK_READY', { trackId: pendingTrack.id });
+        }
+      })
+      .catch(() => {
+        // If it never loads, the server's safety timeout still moves things
+        // along after a few seconds rather than hanging the whole room.
+      });
+    return () => { cancelled = true; };
+  }, [pendingTrack?.id]);
 
   useEffect(() => {
     if (currentTrack) {
@@ -123,16 +135,10 @@ export const RoomView: React.FC<RoomViewProps> = ({
     }
   };
 
-  const handleManualOffsetChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseInt(e.target.value, 10);
-    setManualOffsetMs(val);
-    audioEngine.setManualSyncOffset(val);
-  };
-
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newPos = parseFloat(e.target.value);
+    setTrackPositionSec(newPos);
     if (isHost || room.settings.allowParticipantControl) {
-      setTrackPositionSec(newPos);
       socketClient.send('PLAYBACK_COMMAND', {
         action: 'SEEK',
         position: newPos
@@ -343,6 +349,11 @@ export const RoomView: React.FC<RoomViewProps> = ({
               </div>
               <h3 className="text-xl font-semibold tracking-tight">{currentTrack?.title || 'Select a track'}</h3>
               <p className={`text-sm ${subtle}`}>{currentTrack?.artist || 'AudioSync library'}</p>
+              {pendingTrack && (
+                <p className={`text-xs mt-1 flex items-center gap-1 ${isDarkMode ? 'text-amber-400' : 'text-amber-600'}`}>
+                  <RefreshCw size={11} className="animate-spin" /> Next up: {pendingTrack.title}
+                </p>
+              )}
             </div>
           </div>
 
@@ -374,17 +385,25 @@ export const RoomView: React.FC<RoomViewProps> = ({
           <div className="flex items-center justify-between pt-1">
             <div className="flex items-center gap-3">
               <button
-                disabled={!isHost && !room.settings.allowParticipantControl}
+                disabled={(!isHost && !room.settings.allowParticipantControl) || !!pendingTrack}
                 onClick={handleTogglePlay}
                 className={`w-11 h-11 rounded-full disabled:opacity-40 flex items-center justify-center transition ${
                   isDarkMode ? 'bg-white text-black hover:bg-zinc-200' : 'bg-zinc-900 text-white hover:bg-zinc-700'
                 }`}
               >
-                {isPlaying ? <Pause size={18} /> : <Play size={18} className="ml-0.5" />}
+                {pendingTrack ? (
+                  <RefreshCw size={16} className="animate-spin" />
+                ) : isPlaying ? (
+                  <Pause size={18} />
+                ) : (
+                  <Play size={18} className="ml-0.5" />
+                )}
               </button>
 
               <p className={`text-xs ${subtle}`}>
-                {startingInMs > 250
+                {pendingTrack
+                  ? `Buffering on every device… ${room.readiness.readyCount}/${room.readiness.totalCount} ready`
+                  : startingInMs > 250
                   ? `Starting in ${(startingInMs / 1000).toFixed(1)}s…`
                   : (!isHost && !room.settings.allowParticipantControl ? 'Controlled by host' : 'Host controls active')}
               </p>
@@ -467,9 +486,8 @@ export const RoomView: React.FC<RoomViewProps> = ({
                     <span className="flex items-center gap-1">
                       <Wifi size={11} /> {p.rttMs}ms
                     </span>
-                    <span className={`flex items-center gap-1 ${p.isBuffering ? 'text-amber-500' : p.isSynced ? 'text-emerald-500' : 'text-rose-500'}`}>
-                      <span className={`w-1 h-1 rounded-full ${p.isBuffering ? 'bg-amber-500' : p.isSynced ? 'bg-emerald-500' : 'bg-rose-500'}`} />
-                      {p.isBuffering ? 'Buffering' : p.isSynced ? 'Synced' : 'Drifted'}
+                    <span className="flex items-center gap-1 text-emerald-500">
+                      <span className="w-1 h-1 rounded-full bg-emerald-500" /> Synced
                     </span>
                   </div>
                 </div>
@@ -624,39 +642,6 @@ export const RoomView: React.FC<RoomViewProps> = ({
               <div className={`p-3 rounded-lg border ${isDarkMode ? 'border-white/10 bg-black/20' : 'border-zinc-200 bg-zinc-50'}`}>
                 <p className={`text-[11px] font-medium uppercase ${subtle}`}>Output latency</p>
                 <p className="text-xl font-mono font-semibold mt-1">{Math.round(audioEngine.getOutputLatencyMs())} ms</p>
-              </div>
-            </div>
-
-            {/* Manual Sync Calibration */}
-            <div className={`p-4 rounded-xl border mt-4 ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-zinc-200 bg-white'}`}>
-              <div className="flex justify-between items-center mb-4">
-                <div>
-                  <h4 className="font-medium text-sm">Manual Sync Calibration</h4>
-                  <p className={`text-xs mt-1 ${subtle}`}>Fix asymmetric internet delay</p>
-                </div>
-                <div className="text-right">
-                  <span className={`text-sm font-mono font-medium ${manualOffsetMs > 0 ? (isDarkMode ? 'text-amber-400' : 'text-amber-600') : manualOffsetMs < 0 ? (isDarkMode ? 'text-blue-400' : 'text-blue-600') : ''}`}>
-                    {manualOffsetMs > 0 ? `+${manualOffsetMs}` : manualOffsetMs} ms
-                  </span>
-                </div>
-              </div>
-              <input
-                type="range"
-                min="-200"
-                max="200"
-                step="5"
-                value={manualOffsetMs}
-                onChange={handleManualOffsetChange}
-                className="w-full h-2 rounded-lg appearance-none cursor-pointer"
-                style={{
-                  background: isDarkMode ? '#3f3f46' : '#e4e4e7',
-                  accentColor: isDarkMode ? '#3b82f6' : '#2563eb'
-                }}
-              />
-              <div className={`flex justify-between text-[10px] mt-2 font-medium uppercase ${subtle}`}>
-                <span>Audio Slower</span>
-                <span>Normal</span>
-                <span>Audio Faster</span>
               </div>
             </div>
           </div>
