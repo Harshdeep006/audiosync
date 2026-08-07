@@ -134,7 +134,8 @@ class SocketClient {
         this.send('LATENCY_REPORT', {
           rttMs: audioEngine.getSmoothedRTT(),
           clockOffsetMs: audioEngine.getSmoothedOffset(),
-          isBuffering: audioEngine.getIsLoadingTrack()
+          isBuffering: audioEngine.getIsLoadingTrack(),
+          clientCompensationMs: audioEngine.getOutputLatencyMs()
         });
       }
     }, 3000);

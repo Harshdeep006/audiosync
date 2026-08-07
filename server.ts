@@ -38,6 +38,8 @@ interface RoomServer {
     clockOffsetMs: number;
     isSynced: boolean;
     isBuffering: boolean;
+    clientCompensationMs?: number;
+    clientNudgeMs?: number;
     volume: number;
     deviceType: string;
     joinedAt: number;
@@ -144,7 +146,18 @@ function computeCommitLeadMs(room: RoomServer): number {
     .map((p) => p.rttMs)
     .filter((rtt) => rtt > 0);
   const worstRtt = observedRtts.length > 0 ? Math.max(...observedRtts) : 150;
-  return Math.max(400, Math.min(3000, worstRtt + 300));
+  
+  // Calculate dynamic scheduling delay based on max RTT
+  const dynamicDelay = Math.max(400, worstRtt * 1.5 + 200);
+  const baseDelayMs = Math.min(dynamicDelay, 3000);
+
+  // Get max compensation (output latency + manual nudge) across all clients
+  const maxCompensation = Math.max(0, ...Array.from(room.participants.values()).map(p => 
+    (p.clientCompensationMs || 0) + (p.clientNudgeMs || 0)
+  ));
+  
+  // Ensure enough headroom for the client with the largest local compensation
+  return Math.max(baseDelayMs, maxCompensation + 200);
 }
 
 function getLocalNetworkAddresses(): string[] {
@@ -671,6 +684,8 @@ async function startServer() {
             p.clockOffsetMs = payload.clockOffsetMs || 0;
             p.isSynced = Math.abs(p.clockOffsetMs) <= room.settings.maxAllowedDriftMs;
             p.isBuffering = payload.isBuffering || false;
+            p.clientCompensationMs = payload.clientCompensationMs;
+            p.clientNudgeMs = payload.clientNudgeMs;
             broadcastRoomState(roomCode);
           }
           return;

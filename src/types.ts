@@ -19,6 +19,8 @@ export interface Participant {
   isSynced: boolean;
   isBuffering: boolean;
   batteryLevel?: number;
+  clientCompensationMs?: number;
+  clientNudgeMs?: number;
   volume: number;
   deviceType: 'mobile' | 'desktop' | 'tablet';
   joinedAt: number;
